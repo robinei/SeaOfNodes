@@ -1,542 +1,9 @@
-use std::{collections::HashMap, num::NonZeroU32};
-
-use ordered_float::OrderedFloat;
+mod constraints;
+mod types;
+use std::collections::HashMap;
+use types::*;
 
 pub type NodeId = u32;
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum BoolConstraint {
-    Any,
-    Const(bool),
-}
-
-impl BoolConstraint {
-    #[inline]
-    pub fn is_const(&self) -> bool {
-        return matches!(self, BoolConstraint::Const(..));
-    }
-
-    #[inline]
-    pub fn get_const_value(&self) -> Option<bool> {
-        match self {
-            BoolConstraint::Const(value) => Some(*value),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn combine(self, other: Self, op: impl FnOnce(bool, bool) -> bool) -> Self {
-        match (self, other) {
-            (BoolConstraint::Const(lval), BoolConstraint::Const(rval)) => {
-                BoolConstraint::Const(op(lval, rval))
-            }
-            _ => BoolConstraint::Any,
-        }
-    }
-
-    #[inline]
-    pub fn and(self, other: Self) -> Self {
-        self.combine(other, |lval, rval| lval && rval)
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct IntConstraint {
-    pub min: i64,
-    pub max: i64,
-}
-
-impl IntConstraint {
-    #[inline]
-    pub const fn new(min: i64, max: i64) -> Self {
-        Self { min, max }
-    }
-
-    #[inline]
-    pub fn is_const(&self) -> bool {
-        self.min == self.max
-    }
-
-    #[inline]
-    pub fn get_const_value(&self) -> Option<i64> {
-        if self.is_const() {
-            Some(self.min)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn combine_constraints(
-        self,
-        other: Self,
-        lp: IntPrim,
-        rp: IntPrim,
-        op: impl Fn(Self, Self) -> Option<(i64, i64)>,
-    ) -> Result<(IntPrim, Self), ()> {
-        // Resolve result primitive type
-        let result_prim = match (lp, rp) {
-            (l, r) if l == r => l,
-            (IntPrim::I64, r) if self.is_const() => r,
-            (l, IntPrim::I64) if other.is_const() => l,
-            _ => return Err(()),
-        };
-
-        let has_const = self.is_const() || other.is_const();
-
-        // Apply operation to get min/max bounds
-        let constraint = match op(self, other) {
-            Some((min, max)) => {
-                let clamped_min = min.max(result_prim.min());
-                let clamped_max = max.min(result_prim.max());
-
-                if (min != clamped_min || max != clamped_max) && has_const {
-                    return Err(()); // Provable overflow
-                }
-
-                Self::new(clamped_min, clamped_max)
-            }
-            None => {
-                if has_const {
-                    return Err(()); // Constant overflow
-                }
-                // Fall back to full range
-                Self::new(result_prim.min(), result_prim.max())
-            }
-        };
-
-        Ok((result_prim, constraint))
-    }
-
-    #[inline]
-    pub fn add(self, other: Self, lp: IntPrim, rp: IntPrim) -> Result<(IntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            Some((
-                a.min.checked_add(b.min)?,
-                a.max.checked_add(b.max)?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn sub(self, other: Self, lp: IntPrim, rp: IntPrim) -> Result<(IntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            Some((
-                a.min.checked_sub(b.max)?,
-                a.max.checked_sub(b.min)?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn mul(self, other: Self, lp: IntPrim, rp: IntPrim) -> Result<(IntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            let products = [
-                a.min.checked_mul(b.min)?,
-                a.min.checked_mul(b.max)?,
-                a.max.checked_mul(b.min)?,
-                a.max.checked_mul(b.max)?,
-            ];
-            Some((
-                *products.iter().min()?,
-                *products.iter().max()?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn div(self, other: Self, lp: IntPrim, rp: IntPrim) -> Result<(IntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            // Check for division by zero
-            if b.min <= 0 && b.max >= 0 {
-                return None; // Division by zero possible
-            }
-
-            let quotients = [
-                a.min.checked_div(b.min)?,
-                a.min.checked_div(b.max)?,
-                a.max.checked_div(b.min)?,
-                a.max.checked_div(b.max)?,
-            ];
-            Some((
-                *quotients.iter().min()?,
-                *quotients.iter().max()?,
-            ))
-        })
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct UIntConstraint {
-    pub min: u64,
-    pub max: u64,
-}
-
-impl UIntConstraint {
-    #[inline]
-    pub const fn new(min: u64, max: u64) -> Self {
-        Self { min, max }
-    }
-
-    #[inline]
-    pub fn is_const(&self) -> bool {
-        self.min == self.max
-    }
-
-    #[inline]
-    pub fn get_const_value(&self) -> Option<u64> {
-        if self.is_const() {
-            Some(self.min)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn combine_constraints(
-        self,
-        other: Self,
-        lp: UIntPrim,
-        rp: UIntPrim,
-        op: impl Fn(Self, Self) -> Option<(u64, u64)>,
-    ) -> Result<(UIntPrim, Self), ()> {
-        // Resolve result primitive type
-        let result_prim = match (lp, rp) {
-            (l, r) if l == r => l,
-            (UIntPrim::U64, r) if self.is_const() => r,
-            (l, UIntPrim::U64) if other.is_const() => l,
-            _ => return Err(()),
-        };
-
-        let has_const = self.is_const() || other.is_const();
-
-        // Apply operation to get min/max bounds
-        let constraint = match op(self, other) {
-            Some((min, max)) => {
-                let clamped_min = min.max(result_prim.min());
-                let clamped_max = max.min(result_prim.max());
-
-                if (min != clamped_min || max != clamped_max) && has_const {
-                    return Err(()); // Provable overflow
-                }
-
-                Self::new(clamped_min, clamped_max)
-            }
-            None => {
-                if has_const {
-                    return Err(()); // Constant overflow
-                }
-                // Fall back to full range
-                Self::new(result_prim.min(), result_prim.max())
-            }
-        };
-
-        Ok((result_prim, constraint))
-    }
-
-    #[inline]
-    pub fn add(self, other: Self, lp: UIntPrim, rp: UIntPrim) -> Result<(UIntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            Some((
-                a.min.checked_add(b.min)?,
-                a.max.checked_add(b.max)?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn sub(self, other: Self, lp: UIntPrim, rp: UIntPrim) -> Result<(UIntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            Some((
-                a.min.checked_sub(b.max)?,
-                a.max.checked_sub(b.min)?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn mul(self, other: Self, lp: UIntPrim, rp: UIntPrim) -> Result<(UIntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            let products = [
-                a.min.checked_mul(b.min)?,
-                a.min.checked_mul(b.max)?,
-                a.max.checked_mul(b.min)?,
-                a.max.checked_mul(b.max)?,
-            ];
-            Some((
-                *products.iter().min()?,
-                *products.iter().max()?,
-            ))
-        })
-    }
-
-    #[inline]
-    pub fn div(self, other: Self, lp: UIntPrim, rp: UIntPrim) -> Result<(UIntPrim, Self), ()> {
-        self.combine_constraints(other, lp, rp, |a, b| {
-            // Check for division by zero
-            if b.min == 0 {
-                return None; // Division by zero possible
-            }
-
-            let quotients = [
-                a.min.checked_div(b.min)?,
-                a.min.checked_div(b.max)?,
-                a.max.checked_div(b.min)?,
-                a.max.checked_div(b.max)?,
-            ];
-            Some((
-                *quotients.iter().min()?,
-                *quotients.iter().max()?,
-            ))
-        })
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum FloatConstraint {
-    Any32,
-    Any64,
-    Const(OrderedFloat<f64>),
-}
-
-impl FloatConstraint {
-    #[inline]
-    pub fn is_const(&self) -> bool {
-        return matches!(self, FloatConstraint::Const(..));
-    }
-
-    #[inline]
-    pub fn get_const_value(&self) -> Option<f64> {
-        match self {
-            FloatConstraint::Const(OrderedFloat(value)) => Some(*value),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn combine(self, other: Self, op: impl FnOnce(f64, f64) -> f64) -> Self {
-        match (self, other) {
-            (
-                FloatConstraint::Const(OrderedFloat(lval)),
-                FloatConstraint::Const(OrderedFloat(rval)),
-            ) => FloatConstraint::Const(OrderedFloat(op(lval, rval))),
-            (
-                FloatConstraint::Any32 | FloatConstraint::Const(..),
-                FloatConstraint::Any32 | FloatConstraint::Const(..),
-            ) => FloatConstraint::Any32,
-            (
-                FloatConstraint::Any64 | FloatConstraint::Const(..),
-                FloatConstraint::Any64 | FloatConstraint::Const(..),
-            ) => FloatConstraint::Any64,
-            _ => unreachable!("bad type combination"),
-        }
-    }
-
-    #[inline]
-    pub fn add(self, other: Self) -> Self {
-        self.combine(other, |lval, rval| lval + rval)
-    }
-}
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum IntPrim {
-    I8,
-    I16,
-    I32,
-    I64,
-}
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum UIntPrim {
-    U8,
-    U16,
-    U32,
-    U64,
-}
-
-impl IntPrim {
-    pub const fn min(self) -> i64 {
-        match self {
-            IntPrim::I8 => i8::MIN as i64,
-            IntPrim::I16 => i16::MIN as i64,
-            IntPrim::I32 => i32::MIN as i64,
-            IntPrim::I64 => i64::MIN,
-        }
-    }
-
-    pub const fn max(self) -> i64 {
-        match self {
-            IntPrim::I8 => i8::MAX as i64,
-            IntPrim::I16 => i16::MAX as i64,
-            IntPrim::I32 => i32::MAX as i64,
-            IntPrim::I64 => i64::MAX,
-        }
-    }
-}
-
-impl UIntPrim {
-    pub const fn min(self) -> u64 {
-        match self {
-            UIntPrim::U8 => u8::MIN as u64,
-            UIntPrim::U16 => u16::MIN as u64,
-            UIntPrim::U32 => u32::MIN as u64,
-            UIntPrim::U64 => u64::MIN,
-        }
-    }
-
-    pub const fn max(self) -> u64 {
-        match self {
-            UIntPrim::U8 => u8::MAX as u64,
-            UIntPrim::U16 => u16::MAX as u64,
-            UIntPrim::U32 => u32::MAX as u64,
-            UIntPrim::U64 => u64::MAX,
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Type {
-    Any,   // top
-    Never, // bottom
-
-    Control,
-    Memory,
-
-    // types for values
-    Unit,
-    Bool(BoolConstraint),
-    Int(IntPrim, IntConstraint),
-    UInt(UIntPrim, UIntConstraint),
-    Float(FloatConstraint),
-}
-
-impl Type {
-    pub const UNIT: Type = Type::Unit;
-    pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
-    pub const I8: Type = Type::prim_int(IntPrim::I8);
-    pub const I16: Type = Type::prim_int(IntPrim::I16);
-    pub const I32: Type = Type::prim_int(IntPrim::I32);
-    pub const I64: Type = Type::prim_int(IntPrim::I64);
-    pub const U8: Type = Type::prim_uint(UIntPrim::U8);
-    pub const U16: Type = Type::prim_uint(UIntPrim::U16);
-    pub const U32: Type = Type::prim_uint(UIntPrim::U32);
-    pub const U64: Type = Type::prim_uint(UIntPrim::U64);
-    pub const F32: Type = Type::Float(FloatConstraint::Any32);
-    pub const F64: Type = Type::Float(FloatConstraint::Any64);
-
-    #[inline]
-    pub fn const_bool(value: bool) -> Type {
-        Type::Bool(BoolConstraint::Const(value))
-    }
-    #[inline]
-    pub fn const_int(value: i64) -> Type {
-        Type::Int(IntPrim::I64, IntConstraint::new(value, value))
-    }
-    #[inline]
-    pub fn const_uint(value: u64) -> Type {
-        Type::UInt(UIntPrim::U64, UIntConstraint::new(value, value))
-    }
-    #[inline]
-    pub fn const_float(value: f64) -> Type {
-        Type::Float(FloatConstraint::Const(OrderedFloat(value)))
-    }
-
-    #[inline]
-    pub const fn new_int(t: (IntPrim, IntConstraint)) -> Self {
-        Type::Int(t.0, t.1)
-    }
-    #[inline]
-    pub const fn new_uint(t: (UIntPrim, UIntConstraint)) -> Self {
-        Type::UInt(t.0, t.1)
-    }
-    #[inline]
-    pub const fn prim_int(prim: IntPrim) -> Self {
-        Type::Int(prim, IntConstraint::new(prim.min(), prim.max()))
-    }
-    #[inline]
-    pub const fn prim_uint(prim: UIntPrim) -> Self {
-        Type::UInt(prim, UIntConstraint::new(prim.min(), prim.max()))
-    }
-
-    #[inline]
-    pub fn num_of_same_type(&self, value: u32) -> Node {
-        match self {
-            Type::Int(..) => Node::const_int(value as i64),
-            Type::UInt(..) => Node::const_uint(value as u64),
-            Type::Float(..) => Node::const_float(value as f64),
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline]
-    pub fn is_const(&self) -> bool {
-        match self {
-            Type::Unit => true,
-            Type::Bool(c) => c.is_const(),
-            Type::Int(_, c) => c.is_const(),
-            Type::UInt(_, c) => c.is_const(),
-            Type::Float(c) => c.is_const(),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    pub fn is_const_zero(&self) -> bool {
-        match self {
-            Self::Int(_, c) => c.get_const_value() == Some(0),
-            Self::UInt(_, c) => c.get_const_value() == Some(0),
-            Self::Float(c) => c.get_const_value() == Some(0.0),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    pub fn is_const_one(&self) -> bool {
-        match self {
-            Self::Int(_, c) => c.get_const_value() == Some(1),
-            Self::UInt(_, c) => c.get_const_value() == Some(1),
-            Self::Float(c) => c.get_const_value() == Some(1.0),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    pub fn get_const_bool(&self) -> Option<bool> {
-        match self {
-            Self::Bool(c) => c.get_const_value(),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn get_const_int(&self) -> Option<i64> {
-        match self {
-            Self::Int(_, c) => c.get_const_value(),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn get_const_uint(&self) -> Option<u64> {
-        match self {
-            Self::UInt(_, c) => c.get_const_value(),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub fn get_const_float(&self) -> Option<f64> {
-        match self {
-            Self::Float(c) => c.get_const_value(),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeId(NonZeroU32);
 
 #[derive(Default, Copy, Clone, PartialEq, Eq)]
 struct NodeListEntry {
@@ -603,10 +70,10 @@ union NodeData {
     interned_id: NodeId,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct Node {
     kind: NodeKind,
-    flags: u8,
+    _flags: u8,
     inputs_count: u16,
     _pad: u32,
     t: Type,
@@ -620,6 +87,16 @@ impl Node {
         node.kind = kind;
         node.t = t;
         node
+    }
+
+    #[inline]
+    pub fn num_of_type(value: u32, t: &Type) -> Node {
+        match t {
+            Type::Int(..) => Node::const_int(value as i64),
+            Type::UInt(..) => Node::const_uint(value as u64),
+            Type::Float(..) => Node::const_float(value as f64),
+            _ => unreachable!(),
+        }
     }
 
     #[inline]
@@ -745,11 +222,13 @@ impl IRBuilder {
         if let Some(interned_id) = node.get_interned_id() {
             interned_id
         } else {
-            *self.interned_nodes.entry(*node).or_insert_with(|| {
-                let id = self.nodes.len() as NodeId;
-                self.nodes.push(*node);
-                id
-            })
+            if let Some(interned_id) = self.interned_nodes.get(node) {
+                *interned_id
+            } else {
+                let interned_id = self.nodes.len() as NodeId;
+                self.interned_nodes.insert(node.clone(), interned_id);
+                interned_id
+            }
         }
     }
 
@@ -757,36 +236,31 @@ impl IRBuilder {
         let l = self.resolve(lhs);
         let r = self.resolve(rhs);
 
-        let t = match (l.t, r.t) {
-            (Type::Int(lp, lc), Type::Int(rp, rc)) => Type::new_int(lc.add(rc, lp, rp)?),
-            (Type::UInt(lp, lc), Type::UInt(rp, rc)) => Type::new_uint(lc.add(rc, lp, rp)?),
-            (Type::Float(lc), Type::Float(rc)) => Type::Float(lc.add(rc)),
-            _ => unreachable!("bad type combination"),
-        };
+        let t = l.t.add(&r.t)?;
 
         Ok(if t.is_const() {
             // constant-folded
             Node::new(NodeKind::Const, t)
         } else if l.t.is_const_zero() {
             // 0 + x => x
-            *r
+            r.clone()
         } else if r.t.is_const_zero() {
             // x + 0 => x
-            *l
+            l.clone()
         } else if l == r {
             // x + x => x * 2
-            self.create_mul(lhs, &t.num_of_same_type(2))?
+            self.create_mul(lhs, &Node::num_of_type(2, &t))?
         } else if l.kind != NodeKind::Add && r.kind == NodeKind::Add {
             // non-add + add => add + non-add
             self.create_add(rhs, lhs)?
         } else if r.kind == NodeKind::Neg {
             // x + (-y) => x - y
-            let y = *self.lookup(r.get_input(1));
+            let y = self.lookup(r.get_input(1)).clone();
             self.create_sub(lhs, &y)?
         } else if r.kind == NodeKind::Add {
             // x + (y + z) => (x + y) + z
-            let y = *self.lookup(r.get_input(1));
-            let z = *self.lookup(r.get_input(2));
+            let y = self.lookup(r.get_input(1)).clone();
+            let z = self.lookup(r.get_input(2)).clone();
             let xy = self.create_add(lhs, &y)?;
             self.create_add(&xy, &z)?
         } else {
@@ -796,11 +270,11 @@ impl IRBuilder {
         })
     }
 
-    pub fn create_sub(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, ()> {
+    pub fn create_sub(&mut self, _lhs: &Node, _rhs: &Node) -> Result<Node, ()> {
         todo!()
     }
 
-    pub fn create_mul(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, ()> {
+    pub fn create_mul(&mut self, _lhs: &Node, _rhs: &Node) -> Result<Node, ()> {
         todo!()
     }
 

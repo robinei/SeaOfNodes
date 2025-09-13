@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 ordered-float = "5.0.0"
+num-traits = "0.2"
