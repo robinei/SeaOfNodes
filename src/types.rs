@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 
@@ -20,6 +20,8 @@ pub enum Type {
     Float(FloatConstraint),
 
     Union(Arc<[Type]>),
+
+    Error(Arc<Type>),
 }
 
 impl Type {
@@ -35,6 +37,36 @@ impl Type {
     pub const U64: Type = Type::prim_uint(UIntPrim::U64);
     pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
+
+    pub fn normalize(self) -> Type {
+        match self {
+            Type::Error(inner) => {
+                let normalized_inner = Arc::try_unwrap(inner)
+                    .unwrap_or_else(|arc| (*arc).clone())
+                    .normalize();
+
+                match normalized_inner {
+                    Type::Never => Type::Never,
+                    Type::Error(deeper) => Type::Error(deeper), // Unwrap nested
+                    Type::Union(types) => {
+                        // Distribute: Error(Union([A, B])) → make_union([Error(A), Error(B)])
+                        let error_types: Vec<Type> = types
+                            .iter()
+                            .map(|t| Type::Error(Arc::new(t.clone())))
+                            .collect();
+                        Type::make_union(error_types) // Will handle Error merging
+                    }
+                    other => Type::Error(Arc::new(other)),
+                }
+            }
+            Type::Union(types) => {
+                // Normalize each member first, then make_union
+                let normalized: Vec<Type> = types.iter().map(|t| t.clone().normalize()).collect();
+                Type::make_union(normalized)
+            }
+            other => other, // Already normalized
+        }
+    }
 
     pub fn make_union(mut types: Vec<Type>) -> Type {
         // Flatten nested unions in-place
@@ -83,6 +115,10 @@ impl Type {
                         // Adjacent or overlapping with overflow protection
                         lc.max.saturating_add(1) >= rc.min
                     }
+                    (Type::Error(_), Type::Error(_)) => {
+                        // Always merge adjacent errors
+                        true
+                    }
                     _ => false,
                 };
 
@@ -94,6 +130,15 @@ impl Type {
                         }
                         (Type::UInt(prim, lc), Type::UInt(_, rc)) => {
                             Type::UInt(*prim, UIntConstraint::new(lc.min, lc.max.max(rc.max)))
+                        }
+                        (Type::Error(linner), Type::Error(rinner)) => {
+                            let merged_contents = Type::make_union(vec![
+                                Arc::try_unwrap(linner.clone())
+                                    .unwrap_or_else(|arc| (*arc).clone()),
+                                Arc::try_unwrap(rinner.clone())
+                                    .unwrap_or_else(|arc| (*arc).clone()),
+                            ]);
+                            Type::Error(Arc::new(merged_contents))
                         }
                         _ => unreachable!(),
                     };
@@ -424,9 +469,6 @@ impl Type {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeId(NonZeroU32);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +602,54 @@ mod tests {
 
         // Any should subsume everything
         assert_eq!(result, Type::Any);
+    }
+
+    #[test]
+    fn test_error_normalization() {
+        // Test Error(Never) → Never
+        let result = Type::Error(Arc::new(Type::Never)).normalize();
+        assert_eq!(result, Type::Never);
+
+        // Test Error(Error(T)) → Error(T)
+        let inner_error = Type::Error(Arc::new(Type::I32));
+        let nested_error = Type::Error(Arc::new(inner_error));
+        let result = nested_error.normalize();
+        assert_eq!(result, Type::Error(Arc::new(Type::I32)));
+    }
+
+    #[test]
+    fn test_error_merging_in_unions() {
+        // Test Union([Error(A), Error(B)]) → Error(Union([A, B]))
+        let result = Type::make_union(vec![
+            Type::Error(Arc::new(Type::I32)),
+            Type::Error(Arc::new(Type::Bool(BoolConstraint::Any))),
+        ]);
+
+        match result {
+            Type::Error(inner) => match &*inner {
+                Type::Union(types) => {
+                    assert_eq!(types.len(), 2);
+                    assert!(types.contains(&Type::Bool(BoolConstraint::Any)));
+                    assert!(types.contains(&Type::I32));
+                }
+                _ => panic!("Expected Error(Union(...))"),
+            },
+            _ => panic!("Expected Error type"),
+        }
+
+        // Test mixed union: Union([A, Error(B)]) stays as-is
+        let result = Type::make_union(vec![
+            Type::I32,
+            Type::Error(Arc::new(Type::Bool(BoolConstraint::Any))),
+        ]);
+
+        match result {
+            Type::Union(types) => {
+                assert_eq!(types.len(), 2);
+                assert!(types.contains(&Type::I32));
+                assert!(types.contains(&Type::Error(Arc::new(Type::Bool(BoolConstraint::Any)))));
+            }
+            _ => panic!("Expected Union with mixed types"),
+        }
     }
 }
