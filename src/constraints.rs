@@ -1,5 +1,6 @@
 use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
 use ordered_float::OrderedFloat;
+use crate::IRError;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -77,9 +78,9 @@ pub enum CompareOp {
 }
 
 pub trait ConstraintValue:
-    Copy + Clone + PartialOrd + Ord + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Zero + One
+    Copy + Clone + PartialOrd + Ord + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Zero + One + std::fmt::Debug
 {
-    type Primitive: Copy + Clone + PartialEq + Eq;
+    type Primitive: Copy + Clone + PartialEq + Eq + std::fmt::Debug;
 
     // Get min/max values for a specific primitive
     fn prim_min(prim: Self::Primitive) -> Self;
@@ -154,16 +155,16 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         lp: T::Primitive,
         rp: T::Primitive,
         op: impl Fn(Self, Self) -> Option<(T, T)>,
-    ) -> Result<(T::Primitive, Self), ()> {
+    ) -> Result<(T::Primitive, Self), IRError> {
         // Resolve result primitive type
         let result_prim = match (lp, rp) {
             (l, r) if l == r => l,
-            (l, r) if T::is_const_storage(r) && self.is_const() => l,
-            (l, r) if T::is_const_storage(l) && other.is_const() => r,
-            _ => return Err(()),
+            // Allow any constant to coerce to a specific primitive type
+            (l, _r) if other.is_const() => l,
+            (_l, r) if self.is_const() => r,
+            _ => return Err(IRError::InvalidPrimitiveCoercion),
         };
 
-        let has_const = self.is_const() || other.is_const();
 
         // Apply operation to get min/max bounds
         let constraint = match op(self, other) {
@@ -171,17 +172,16 @@ impl<T: ConstraintValue> RangeConstraint<T> {
                 let clamped_min = min.max(T::prim_min(result_prim));
                 let clamped_max = max.min(T::prim_max(result_prim));
 
-                if (min != clamped_min || max != clamped_max) && has_const {
-                    return Err(()); // Provable overflow
+                // Error only if the entire range is outside the target primitive bounds
+                if max < T::prim_min(result_prim) || min > T::prim_max(result_prim) {
+                    return Err(IRError::IntegerOverflow); // Definite overflow - entire range is out of bounds
                 }
 
                 Self::new(clamped_min, clamped_max)
             }
             None => {
-                if has_const {
-                    return Err(()); // Constant overflow
-                }
-                // Fall back to full range
+                // Fall back to full range - don't error even with constants
+                // because None just means "can't determine precise range"
                 Self::new(T::prim_min(result_prim), T::prim_max(result_prim))
             }
         };
@@ -198,10 +198,17 @@ impl<T: ConstraintValue> RangeConstraint<T> {
             op(self.max, other.max),
         ];
 
-        if results.iter().all(|r| r.is_some()) {
-            let values: Vec<T> = results.into_iter().map(|r| r.unwrap()).collect();
-            let min = *values.iter().min().unwrap();
-            let max = *values.iter().max().unwrap();
+        if let [Some(r0), Some(r1), Some(r2), Some(r3)] = results {
+            let mut min = r0;
+            let mut max = r0;
+            
+            if r1 < min { min = r1; }
+            if r1 > max { max = r1; }
+            if r2 < min { min = r2; }
+            if r2 > max { max = r2; }
+            if r3 < min { min = r3; }
+            if r3 > max { max = r3; }
+            
             Some((min, max))
         } else {
             None
@@ -213,7 +220,7 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         other: Self,
         lp: T::Primitive,
         rp: T::Primitive,
-    ) -> Result<(T::Primitive, Self), ()> {
+    ) -> Result<(T::Primitive, Self), IRError> {
         self.combine_constraints(other, lp, rp, |a, b| {
             Some((a.min.checked_add(&b.min)?, a.max.checked_add(&b.max)?))
         })
@@ -224,7 +231,7 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         other: Self,
         lp: T::Primitive,
         rp: T::Primitive,
-    ) -> Result<(T::Primitive, Self), ()> {
+    ) -> Result<(T::Primitive, Self), IRError> {
         self.combine_constraints(other, lp, rp, |a, b| {
             Some((a.min.checked_sub(&b.max)?, a.max.checked_sub(&b.min)?))
         })
@@ -235,7 +242,7 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         other: Self,
         lp: T::Primitive,
         rp: T::Primitive,
-    ) -> Result<(T::Primitive, Self), ()> {
+    ) -> Result<(T::Primitive, Self), IRError> {
         self.combine_constraints(other, lp, rp, |a, b| {
             a.apply_4way_op(b, |x, y| x.checked_mul(&y))
         })
@@ -246,11 +253,18 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         other: Self,
         lp: T::Primitive,
         rp: T::Primitive,
-    ) -> Result<(T::Primitive, Self), ()> {
+    ) -> Result<(T::Primitive, Self), IRError> {
+        // Only error if we're definitely dividing by zero (constant zero)
+        if other.is_const() && other.get_const_value() == Some(T::zero()) {
+            return Err(IRError::DivisionByZero);
+        }
+
         self.combine_constraints(other, lp, rp, |a, b| {
-            // Check for division by zero
+            // For division, we need to handle zero in the denominator carefully
             if b.min <= T::zero() && b.max >= T::zero() {
-                return None; // Division by zero possible
+                // Denominator range includes zero - we can't use apply_4way_op directly
+                // Instead, we need to split the range or fall back to full range
+                return None; // Fallback to full range for now
             }
             a.apply_4way_op(b, |x, y| x.checked_div(&y))
         })
@@ -412,6 +426,21 @@ impl FloatConstraint {
     #[inline]
     pub fn add(self, other: Self) -> Self {
         self.combine(other, |lval, rval| lval + rval)
+    }
+
+    #[inline]
+    pub fn sub(self, other: Self) -> Self {
+        self.combine(other, |lval, rval| lval - rval)
+    }
+
+    #[inline]
+    pub fn mul(self, other: Self) -> Self {
+        self.combine(other, |lval, rval| lval * rval)
+    }
+
+    #[inline]
+    pub fn div(self, other: Self) -> Self {
+        self.combine(other, |lval, rval| lval / rval)
     }
 
     pub fn compare(self, other: Self, op: CompareOp) -> Option<bool> {

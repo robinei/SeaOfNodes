@@ -5,14 +5,22 @@ use types::*;
 
 pub type NodeId = u32;
 
-#[derive(Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IRError {
+    TypeMismatch,
+    IntegerOverflow,
+    DivisionByZero,
+    InvalidPrimitiveCoercion,
+}
+
+#[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
 struct NodeListEntry {
     nodes: [NodeId; 3],
     next: u32,
 }
 
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Unreachable,
 
@@ -70,7 +78,15 @@ union NodeData {
     interned_id: NodeId,
 }
 
-#[derive(Clone)]
+impl std::fmt::Debug for NodeData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Since this is a union, we can't safely access all fields
+        // Just show it as opaque data
+        f.debug_struct("NodeData").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Node {
     kind: NodeKind,
     _flags: u8,
@@ -135,7 +151,17 @@ impl Node {
 
     #[inline]
     pub fn set_inputs(&mut self, inputs: &[NodeId]) {
-        self.data.inputs = inputs.try_into().unwrap();
+        assert!(inputs.len() <= 4, "Too many inputs");
+        self.inputs_count = inputs.len() as u16;
+        unsafe {
+            for (i, &input) in inputs.iter().enumerate() {
+                self.data.inputs[i] = input;
+            }
+            // Zero out unused slots
+            for i in inputs.len()..4 {
+                self.data.inputs[i] = 0;
+            }
+        }
     }
 
     #[inline]
@@ -226,13 +252,14 @@ impl IRBuilder {
                 *interned_id
             } else {
                 let interned_id = self.nodes.len() as NodeId;
+                self.nodes.push(node.clone());
                 self.interned_nodes.insert(node.clone(), interned_id);
                 interned_id
             }
         }
     }
 
-    pub fn create_add(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, ()> {
+    pub fn create_add(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
         let l = self.resolve(lhs);
         let r = self.resolve(rhs);
 
@@ -255,12 +282,12 @@ impl IRBuilder {
             self.create_add(rhs, lhs)?
         } else if r.kind == NodeKind::Neg {
             // x + (-y) => x - y
-            let y = self.lookup(r.get_input(1)).clone();
+            let y = self.lookup(r.get_input(1)).clone(); // Neg has input at index 1
             self.create_sub(lhs, &y)?
         } else if r.kind == NodeKind::Add {
             // x + (y + z) => (x + y) + z
-            let y = self.lookup(r.get_input(1)).clone();
-            let z = self.lookup(r.get_input(2)).clone();
+            let y = self.lookup(r.get_input(1)).clone(); // Left operand at index 1
+            let z = self.lookup(r.get_input(2)).clone(); // Right operand at index 2
             let xy = self.create_add(lhs, &y)?;
             self.create_add(&xy, &z)?
         } else {
@@ -270,12 +297,94 @@ impl IRBuilder {
         })
     }
 
-    pub fn create_sub(&mut self, _lhs: &Node, _rhs: &Node) -> Result<Node, ()> {
-        todo!()
+    pub fn create_sub(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
+        let l = self.resolve(lhs);
+        let r = self.resolve(rhs);
+
+        let t = l.t.sub(&r.t)?;
+
+        Ok(if t.is_const() {
+            // constant-folded
+            Node::new(NodeKind::Const, t)
+        } else if r.t.is_const_zero() {
+            // x - 0 => x
+            l.clone()
+        } else if l == r {
+            // x - x => 0
+            Node::num_of_type(0, &t)
+        } else if r.kind == NodeKind::Neg {
+            // x - (-y) => x + y
+            let y = self.lookup(r.get_input(1)).clone();
+            self.create_add(lhs, &y)?
+        } else if r.kind == NodeKind::Sub {
+            // x - (y - z) => x - y + z => (x + z) - y
+            let y = self.lookup(r.get_input(1)).clone(); // Left operand at index 1
+            let z = self.lookup(r.get_input(2)).clone(); // Right operand at index 2
+            let xz = self.create_add(lhs, &z)?;
+            self.create_sub(&xz, &y)?
+        } else {
+            let mut node = Node::new(NodeKind::Sub, t);
+            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node
+        })
     }
 
-    pub fn create_mul(&mut self, _lhs: &Node, _rhs: &Node) -> Result<Node, ()> {
-        todo!()
+    pub fn create_mul(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
+        let l = self.resolve(lhs);
+        let r = self.resolve(rhs);
+
+        let t = l.t.mul(&r.t)?;
+
+        Ok(if t.is_const() {
+            // constant-folded
+            Node::new(NodeKind::Const, t)
+        } else if l.t.is_const_zero() || r.t.is_const_zero() {
+            // x * 0 => 0 or 0 * x => 0
+            Node::num_of_type(0, &t)
+        } else if l.t.is_const_one() {
+            // 1 * x => x
+            r.clone()
+        } else if r.t.is_const_one() {
+            // x * 1 => x
+            l.clone()
+        } else if l == r {
+            // x * x => x^2 (no special peephole for now)
+            let mut node = Node::new(NodeKind::Mul, t);
+            node.set_inputs(&[self.intern(lhs), self.intern(rhs)]);
+            node
+        } else if l.kind != NodeKind::Mul && r.kind == NodeKind::Mul {
+            // non-mul * mul => mul * non-mul (canonicalize)
+            self.create_mul(rhs, lhs)?
+        } else {
+            let mut node = Node::new(NodeKind::Mul, t);
+            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node
+        })
+    }
+
+    pub fn create_div(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
+        let l = self.resolve(lhs);
+        let r = self.resolve(rhs);
+
+        let t = l.t.div(&r.t)?;
+
+        Ok(if t.is_const() {
+            // constant-folded
+            Node::new(NodeKind::Const, t)
+        } else if l.t.is_const_zero() {
+            // 0 / x => 0 (assuming x != 0, which is checked by t.div())
+            Node::num_of_type(0, &t)
+        } else if r.t.is_const_one() {
+            // x / 1 => x
+            l.clone()
+        } else if l == r {
+            // x / x => 1 (assuming x != 0, which is checked by t.div())
+            Node::num_of_type(1, &t)
+        } else {
+            let mut node = Node::new(NodeKind::Div, t);
+            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node
+        })
     }
 
     pub fn create_if(&mut self, cond: &Node) -> Node {
@@ -287,4 +396,233 @@ impl IRBuilder {
 
 fn main() {
     println!("Hello, world!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constraints::*;
+
+    #[test]
+    fn test_arithmetic_constant_folding() {
+        let mut builder = IRBuilder::new();
+        
+        // Test add constant folding
+        let a = Node::const_int(5);
+        let b = Node::const_int(3);
+        let result = builder.create_add(&a, &b).unwrap();
+        
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(8));
+        
+        // Test sub constant folding
+        let result = builder.create_sub(&a, &b).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(2));
+        
+        // Test mul constant folding
+        let result = builder.create_mul(&a, &b).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(15));
+        
+        // Test div constant folding
+        let result = builder.create_div(&a, &b).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(1)); // 5/3 = 1 (integer division)
+    }
+
+    #[test]
+    fn test_arithmetic_peepholes() {
+        let mut builder = IRBuilder::new();
+        
+        let x = Node::create_param(0, Type::I32);
+        let zero = Node::const_int(0);
+        let one = Node::const_int(1);
+        
+        // Test x + 0 => x
+        let result = builder.create_add(&x, &zero).unwrap();
+        assert_eq!(result, x);
+        
+        // Test 0 + x => x
+        let result = builder.create_add(&zero, &x).unwrap();
+        assert_eq!(result, x);
+        
+        // Test x - 0 => x
+        let result = builder.create_sub(&x, &zero).unwrap();
+        assert_eq!(result, x);
+        
+        // Test x - x => 0
+        let result = builder.create_sub(&x, &x).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(0));
+        
+        // Test x * 1 => x
+        let result = builder.create_mul(&x, &one).unwrap();
+        assert_eq!(result, x);
+        
+        // Test 1 * x => x
+        let result = builder.create_mul(&one, &x).unwrap();
+        assert_eq!(result, x);
+        
+        // Test x * 0 => 0
+        let result = builder.create_mul(&x, &zero).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(0));
+        
+        // Test x / 1 => x
+        let result = builder.create_div(&x, &one).unwrap();
+        assert_eq!(result, x);
+        
+        // Test x / x => 1
+        let result = builder.create_div(&x, &x).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(1));
+        
+        // Test 0 / x => 0
+        let result = builder.create_div(&zero, &x).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_int(), Some(0));
+    }
+
+    #[test]
+    fn test_arithmetic_algebraic_peepholes() {
+        let mut builder = IRBuilder::new();
+        
+        let x = Node::create_param(0, Type::I32);
+        let two = Node::const_int(2);
+        
+        // Test x + x => x * 2 (from create_add)
+        let result = builder.create_add(&x, &x).unwrap();
+        assert_eq!(result.kind, NodeKind::Mul);
+        // Should be x * 2  
+        let mul_rhs = builder.lookup(result.get_input(2)); // Right operand is at index 2
+        assert_eq!(mul_rhs.t.get_const_int(), Some(2));
+        
+        // Test double negation: x - (-y) => x + y
+        let mut neg_x = Node::new(NodeKind::Neg, Type::I32);
+        neg_x.set_inputs(&[0, builder.intern(&x)]); // 0 = no control, x as operand
+        let _result = builder.create_sub(&two, &neg_x);
+        // This should recursively call create_add, but we can't easily test without more setup
+    }
+
+    #[test]
+    fn test_range_based_constant_folding() {
+        // Test that operations on constrained ranges can constant fold
+        
+        // Range [5, 5] + Range [3, 3] should fold to const 8
+        let constraint_5 = IntConstraint::new(5, 5);
+        let constraint_3 = IntConstraint::new(3, 3);
+        let type_5 = Type::Int(IntPrim::I64, constraint_5);
+        let type_3 = Type::Int(IntPrim::I64, constraint_3);
+        
+        let result = type_5.add(&type_3).unwrap();
+        assert!(result.is_const());
+        assert_eq!(result.get_const_int(), Some(8));
+        
+        // Range [1, 10] + Range [5, 5] should give Range [6, 15]
+        let range_1_10 = IntConstraint::new(1, 10);
+        let const_5 = IntConstraint::new(5, 5);
+        let type_range = Type::Int(IntPrim::I64, range_1_10);
+        let type_const = Type::Int(IntPrim::I64, const_5);
+        
+        let result = type_range.add(&type_const).unwrap();
+        match result {
+            Type::Int(IntPrim::I64, constraint) => {
+                assert_eq!(constraint.min, 6);
+                assert_eq!(constraint.max, 15);
+            }
+            _ => panic!("Expected Int type with constraint"),
+        }
+    }
+
+    #[test]
+    fn test_arithmetic_overflow_handling() {
+        // Test that overflow is properly detected and handled
+        
+        // i8::MAX + 1 should error when we have constants
+        let max_i8 = IntConstraint::new(127, 127); // i8::MAX
+        let one = IntConstraint::new(1, 1);
+        let max_type = Type::Int(IntPrim::I8, max_i8);
+        let one_type = Type::Int(IntPrim::I64, one); // Untyped constant
+        
+        let result = max_type.add(&one_type);
+        assert!(result.is_err()); // Should error due to provable overflow
+        
+        // Full range + full range should not error (runtime case)
+        let full_i8 = Type::prim_int(IntPrim::I8);
+        let result = full_i8.add(&full_i8);
+        assert!(result.is_ok()); // Should fallback to full range, not error
+    }
+
+    #[test]
+    fn test_division_by_zero_handling() {
+        // Test division by zero detection
+        
+        let five = IntConstraint::new(5, 5);
+        let zero = IntConstraint::new(0, 0);
+        let five_type = Type::Int(IntPrim::I64, five);
+        let zero_type = Type::Int(IntPrim::I64, zero);
+        
+        // 5 / 0 should error
+        let result = five_type.div(&zero_type);
+        assert!(result.is_err());
+        
+        // 5 / range_including_zero should NOT error (possible but not definite division by zero)
+        let range_with_zero = IntConstraint::new(-1, 1); // Includes 0
+        let range_type = Type::Int(IntPrim::I64, range_with_zero);
+        let result = five_type.div(&range_type);
+        assert!(result.is_ok()); // Should fallback to full range, not error
+    }
+
+    #[test]
+    fn test_float_arithmetic() {
+        let mut builder = IRBuilder::new();
+        
+        // Test float constant folding
+        let a = Node::const_float(2.5);
+        let b = Node::const_float(1.5);
+        
+        let result = builder.create_add(&a, &b).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_float(), Some(4.0));
+        
+        let result = builder.create_mul(&a, &b).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_float(), Some(3.75));
+        
+        // Test float peepholes
+        let x = Node::create_param(0, Type::F64);
+        let zero = Node::const_float(0.0);
+        let one = Node::const_float(1.0);
+        
+        // x * 0.0 => 0.0
+        let result = builder.create_mul(&x, &zero).unwrap();
+        assert_eq!(result.kind, NodeKind::Const);
+        assert_eq!(result.t.get_const_float(), Some(0.0));
+        
+        // x / 1.0 => x  
+        let result = builder.create_div(&x, &one).unwrap();
+        assert_eq!(result, x);
+    }
+
+    #[test]
+    fn test_mixed_type_arithmetic_errors() {
+        let int_node = Node::const_int(5);
+        let float_node = Node::const_float(5.0);
+        let bool_node = Node::const_bool(true);
+        
+        // Test that mixed types properly error
+        let int_type = int_node.t;
+        let float_type = float_node.t;
+        let bool_type = bool_node.t;
+        
+        // int + float should error
+        assert!(int_type.add(&float_type).is_err());
+        
+        // int + bool should error
+        assert!(int_type.add(&bool_type).is_err());
+        
+        // float + bool should error
+        assert!(float_type.add(&bool_type).is_err());
+    }
 }

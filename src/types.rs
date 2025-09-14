@@ -3,6 +3,15 @@ use std::sync::Arc;
 use ordered_float::OrderedFloat;
 
 use crate::constraints::*;
+use crate::IRError;
+
+#[derive(Debug, Copy, Clone)]
+enum ArithmeticOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
@@ -25,6 +34,51 @@ pub enum Type {
 }
 
 impl Type {
+    /// Generic helper for binary arithmetic operations
+    fn apply_arithmetic_op(&self, other: &Self, op: ArithmeticOp) -> Result<Self, IRError> {
+        match (self, other) {
+            (Type::Int(lp, lc), Type::Int(rp, rc)) => {
+                let result = match op {
+                    ArithmeticOp::Add => lc.add(*rc, *lp, *rp)?,
+                    ArithmeticOp::Sub => lc.sub(*rc, *lp, *rp)?,
+                    ArithmeticOp::Mul => lc.mul(*rc, *lp, *rp)?,
+                    ArithmeticOp::Div => lc.div(*rc, *lp, *rp)?,
+                };
+                Ok(Type::new_int(result))
+            }
+            (Type::UInt(lp, lc), Type::UInt(rp, rc)) => {
+                let result = match op {
+                    ArithmeticOp::Add => lc.add(*rc, *lp, *rp)?,
+                    ArithmeticOp::Sub => lc.sub(*rc, *lp, *rp)?,
+                    ArithmeticOp::Mul => lc.mul(*rc, *lp, *rp)?,
+                    ArithmeticOp::Div => lc.div(*rc, *lp, *rp)?,
+                };
+                Ok(Type::new_uint(result))
+            }
+            (Type::Float(lc), Type::Float(rc)) => {
+                let result = match op {
+                    ArithmeticOp::Add => lc.add(*rc),
+                    ArithmeticOp::Sub => lc.sub(*rc),
+                    ArithmeticOp::Mul => lc.mul(*rc),
+                    ArithmeticOp::Div => lc.div(*rc),
+                };
+                Ok(Type::Float(result))
+            }
+            (Type::Union(types), other) => {
+                let results: Result<Vec<_>, _> = types.iter()
+                    .map(|t| t.apply_arithmetic_op(other, op))
+                    .collect();
+                Ok(Self::make_union(results?))
+            }
+            (other, Type::Union(types)) => {
+                let results: Result<Vec<_>, _> = types.iter()
+                    .map(|t| other.apply_arithmetic_op(t, op))
+                    .collect();
+                Ok(Self::make_union(results?))
+            }
+            _ => Err(IRError::TypeMismatch),
+        }
+    }
     pub const UNIT: Type = Type::Unit;
     pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
     pub const I8: Type = Type::prim_int(IntPrim::I8);
@@ -163,21 +217,20 @@ impl Type {
         }
     }
 
-    pub fn add(&self, other: &Self) -> Result<Self, ()> {
-        match (self, other) {
-            (Type::Int(lp, lc), Type::Int(rp, rc)) => Ok(Type::new_int(lc.add(*rc, *lp, *rp)?)),
-            (Type::UInt(lp, lc), Type::UInt(rp, rc)) => Ok(Type::new_uint(lc.add(*rc, *lp, *rp)?)),
-            (Type::Float(lc), Type::Float(rc)) => Ok(Type::Float(lc.add(*rc))),
-            (Type::Union(types), other) => {
-                let results: Result<Vec<_>, _> = types.iter().map(|t| t.add(other)).collect();
-                Ok(Self::make_union(results?))
-            }
-            (other, Type::Union(types)) => {
-                let results: Result<Vec<_>, _> = types.iter().map(|t| other.add(t)).collect();
-                Ok(Self::make_union(results?))
-            }
-            _ => Err(()), // Type mismatch
-        }
+    pub fn add(&self, other: &Self) -> Result<Self, IRError> {
+        self.apply_arithmetic_op(other, ArithmeticOp::Add)
+    }
+
+    pub fn sub(&self, other: &Self) -> Result<Self, IRError> {
+        self.apply_arithmetic_op(other, ArithmeticOp::Sub)
+    }
+
+    pub fn mul(&self, other: &Self) -> Result<Self, IRError> {
+        self.apply_arithmetic_op(other, ArithmeticOp::Mul)
+    }
+
+    pub fn div(&self, other: &Self) -> Result<Self, IRError> {
+        self.apply_arithmetic_op(other, ArithmeticOp::Div)
     }
 
     pub fn intersect(&self, other: &Self) -> Type {
@@ -210,6 +263,18 @@ impl Type {
                 (BoolConstraint::Any, BoolConstraint::Const(_)) => other.clone(),
                 (BoolConstraint::Any, BoolConstraint::Any) => self.clone(),
             },
+
+            // Error intersections
+            (Type::Error(la), Type::Error(ra)) => {
+                let inner_intersection = (**la).clone().intersect(&(**ra));
+                match inner_intersection {
+                    Type::Never => Type::Never,
+                    other => Type::Error(Arc::new(other)),
+                }
+            }
+
+            (Type::Error(_), _) => Type::Never, // Error ∩ non-error = Never
+            (_, Type::Error(_)) => Type::Never, // non-error ∩ Error = Never
 
             // Union intersections
             (Type::Union(types), other) => {
@@ -289,6 +354,18 @@ impl Type {
                 }
             }
 
+            // Error subtraction
+            (Type::Error(la), Type::Error(ra)) => {
+                let inner_subtraction = (**la).clone().subtract(&(**ra));
+                match inner_subtraction {
+                    Type::Never => Type::Never,
+                    other => Type::Error(Arc::new(other)),
+                }
+            }
+
+            (Type::Error(_), _) => self.clone(), // Error - non-error = Error (unchanged)
+            (_, Type::Error(_)) => self.clone(), // non-error - Error = non-error (unchanged)
+
             // Union subtraction
             (Type::Union(types), other) => {
                 let subtracted: Vec<Type> = types
@@ -316,7 +393,7 @@ impl Type {
     }
 
     #[inline]
-    fn compare(&self, other: &Self, op: CompareOp) -> Result<Type, ()> {
+    fn compare(&self, other: &Self, op: CompareOp) -> Result<Type, IRError> {
         match (self, other) {
             (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
                 Ok(Type::bool_from_option(lc.compare(*rc, op)))
@@ -336,31 +413,31 @@ impl Type {
                     types.iter().map(|t| other.compare(t, op)).collect();
                 Ok(Self::make_union(results?))
             }
-            _ => Err(()), // Type mismatch
+            _ => Err(IRError::TypeMismatch),
         }
     }
 
-    pub fn eq(&self, other: &Self) -> Result<Type, ()> {
+    pub fn eq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Eq)
     }
 
-    pub fn neq(&self, other: &Self) -> Result<Type, ()> {
+    pub fn neq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Neq)
     }
 
-    pub fn lt(&self, other: &Self) -> Result<Type, ()> {
+    pub fn lt(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Lt)
     }
 
-    pub fn gt(&self, other: &Self) -> Result<Type, ()> {
+    pub fn gt(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Gt)
     }
 
-    pub fn lteq(&self, other: &Self) -> Result<Type, ()> {
+    pub fn lteq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::LtEq)
     }
 
-    pub fn gteq(&self, other: &Self) -> Result<Type, ()> {
+    pub fn gteq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::GtEq)
     }
 
@@ -651,5 +728,54 @@ mod tests {
             }
             _ => panic!("Expected Union with mixed types"),
         }
+    }
+
+    #[test]
+    fn test_error_intersect() {
+        // Error(A) ∩ Error(B) → Error(A ∩ B)
+        let error_i32 = Type::Error(Arc::new(Type::I32));
+        let error_bool = Type::Error(Arc::new(Type::Bool(BoolConstraint::Any)));
+        let result = error_i32.intersect(&error_bool);
+        assert_eq!(result, Type::Never); // I32 ∩ Bool = Never, so Error(Never) = Never
+
+        // Error(A) ∩ Error(A) → Error(A)
+        let error_i32_2 = Type::Error(Arc::new(Type::I32));
+        let result = error_i32.intersect(&error_i32_2);
+        assert_eq!(result, Type::Error(Arc::new(Type::I32)));
+
+        // Error(A) ∩ B → Never
+        let result = error_i32.intersect(&Type::I32);
+        assert_eq!(result, Type::Never);
+
+        // A ∩ Error(B) → Never
+        let result = Type::I32.intersect(&error_i32);
+        assert_eq!(result, Type::Never);
+    }
+
+    #[test]
+    fn test_error_subtract() {
+        // Error(A) - Error(B) → Error(A - B)
+        let error_union = Type::Error(Arc::new(Type::make_union(vec![Type::I32, Type::Bool(BoolConstraint::Any)])));
+        let error_i32 = Type::Error(Arc::new(Type::I32));
+        let result = error_union.subtract(&error_i32);
+        
+        match result {
+            Type::Error(inner) => {
+                assert_eq!(*inner, Type::Bool(BoolConstraint::Any)); // Union([I32, Bool]) - I32 = Bool
+            }
+            _ => panic!("Expected Error type"),
+        }
+
+        // Error(A) - B → Error(A) (unchanged)
+        let result = error_i32.subtract(&Type::Bool(BoolConstraint::Any));
+        assert_eq!(result, error_i32);
+
+        // A - Error(B) → A (unchanged) 
+        let result = Type::I32.subtract(&error_i32);
+        assert_eq!(result, Type::I32);
+
+        // Error(A) - Error(A) → Never
+        let result = error_i32.subtract(&error_i32);
+        assert_eq!(result, Type::Never);
     }
 }
