@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 
-use crate::constraints::*;
 use crate::IRError;
+use crate::constraints::*;
 
 #[derive(Debug, Copy, Clone)]
 enum ArithmeticOp {
@@ -34,6 +34,68 @@ pub enum Type {
 }
 
 impl Type {
+    /// Try to merge two types in a union. Returns Some(merged) if possible, None if not.
+    fn try_merge_types(left: &Type, right: &Type) -> Option<Type> {
+        match (left, right) {
+            (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
+                // Adjacent or overlapping: [a,b] and [c,d] merge if b+1 >= c
+                if lc.max.saturating_add(1) >= rc.min {
+                    Some(Type::Int(
+                        *lp,
+                        IntConstraint::new(lc.min, lc.max.max(rc.max)),
+                    ))
+                } else {
+                    None
+                }
+            }
+            (Type::UInt(lp, lc), Type::UInt(rp, rc)) if lp == rp => {
+                // Adjacent or overlapping with overflow protection
+                if lc.max.saturating_add(1) >= rc.min {
+                    Some(Type::UInt(
+                        *lp,
+                        UIntConstraint::new(lc.min, lc.max.max(rc.max)),
+                    ))
+                } else {
+                    None
+                }
+            }
+            (Type::Bool(lc), Type::Bool(rc)) => {
+                // Any Bool constraint subsumes more specific ones
+                match (lc, rc) {
+                    (BoolConstraint::Any, _) | (_, BoolConstraint::Any) => {
+                        Some(Type::Bool(BoolConstraint::Any))
+                    }
+                    (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => {
+                        Some(Type::Bool(*lc))
+                    }
+                    (BoolConstraint::Const(_), BoolConstraint::Const(_)) => {
+                        Some(Type::Bool(BoolConstraint::Any))
+                    } // true ∪ false = Any
+                }
+            }
+            (Type::Float(FloatConstraint::Any(prim)), Type::Float(FloatConstraint::Const(_)))
+            | (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(prim))) => {
+                // Polymorphic constant gets subsumed by specific primitive
+                Some(Type::Float(FloatConstraint::Any(*prim)))
+            }
+            (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b)))
+                if a == b =>
+            {
+                // Identical constants merge
+                Some(Type::Float(FloatConstraint::Const(*a)))
+            }
+            (Type::Error(linner), Type::Error(rinner)) => {
+                // Always merge adjacent errors
+                let merged_contents = Type::make_union(vec![
+                    Arc::try_unwrap(linner.clone()).unwrap_or_else(|arc| (*arc).clone()),
+                    Arc::try_unwrap(rinner.clone()).unwrap_or_else(|arc| (*arc).clone()),
+                ]);
+                Some(Type::Error(Arc::new(merged_contents)))
+            }
+            _ => None, // Can't merge
+        }
+    }
+
     /// Generic helper for binary arithmetic operations
     fn apply_arithmetic_op(&self, other: &Self, op: ArithmeticOp) -> Result<Self, IRError> {
         match (self, other) {
@@ -65,13 +127,15 @@ impl Type {
                 Ok(Type::Float(result))
             }
             (Type::Union(types), other) => {
-                let results: Result<Vec<_>, _> = types.iter()
+                let results: Result<Vec<_>, _> = types
+                    .iter()
                     .map(|t| t.apply_arithmetic_op(other, op))
                     .collect();
                 Ok(Self::make_union(results?))
             }
             (other, Type::Union(types)) => {
-                let results: Result<Vec<_>, _> = types.iter()
+                let results: Result<Vec<_>, _> = types
+                    .iter()
                     .map(|t| other.apply_arithmetic_op(t, op))
                     .collect();
                 Ok(Self::make_union(results?))
@@ -79,6 +143,7 @@ impl Type {
             _ => Err(IRError::TypeMismatch),
         }
     }
+
     pub const UNIT: Type = Type::Unit;
     pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
     pub const I8: Type = Type::prim_int(IntPrim::I8);
@@ -160,73 +225,11 @@ impl Type {
             let mut read_pos = 1;
 
             while read_pos < types.len() {
-                let can_merge = match (&types[write_pos], &types[read_pos]) {
-                    (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
-                        // Adjacent or overlapping: [a,b] and [c,d] merge if b+1 >= c
-                        lc.max.saturating_add(1) >= rc.min
-                    }
-                    (Type::UInt(lp, lc), Type::UInt(rp, rc)) if lp == rp => {
-                        // Adjacent or overlapping with overflow protection
-                        lc.max.saturating_add(1) >= rc.min
-                    }
-                    (Type::Bool(_), Type::Bool(_)) => {
-                        // Always merge Bool types - Any subsumes Const
-                        true
-                    }
-                    (Type::Float(FloatConstraint::Any(_prim)), Type::Float(FloatConstraint::Const(_))) |
-                    (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(_prim))) => {
-                        // Float primitive with polymorphic constant - can merge if constant fits
-                        // TODO: check if constant fits in primitive range
-                        true
-                    }
-                    (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b))) => {
-                        // Two float constants - only merge if identical
-                        a == b
-                    }
-                    (Type::Error(_), Type::Error(_)) => {
-                        // Always merge adjacent errors
-                        true
-                    }
-                    _ => false,
-                };
+                // Try to merge types - returns Some(merged) if possible, None if not
+                let merged = Self::try_merge_types(&types[write_pos], &types[read_pos]);
 
-                if can_merge {
-                    // Merge ranges by extending the write_pos element
-                    types[write_pos] = match (&types[write_pos], &types[read_pos]) {
-                        (Type::Int(prim, lc), Type::Int(_, rc)) => {
-                            Type::Int(*prim, IntConstraint::new(lc.min, lc.max.max(rc.max)))
-                        }
-                        (Type::UInt(prim, lc), Type::UInt(_, rc)) => {
-                            Type::UInt(*prim, UIntConstraint::new(lc.min, lc.max.max(rc.max)))
-                        }
-                        (Type::Bool(lc), Type::Bool(rc)) => {
-                            // Any Bool constraint subsumes more specific ones
-                            match (lc, rc) {
-                                (BoolConstraint::Any, _) | (_, BoolConstraint::Any) => Type::Bool(BoolConstraint::Any),
-                                (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => Type::Bool(*lc),
-                                (BoolConstraint::Const(_), BoolConstraint::Const(_)) => Type::Bool(BoolConstraint::Any), // true ∪ false = Any
-                            }
-                        }
-                        (Type::Float(FloatConstraint::Any(prim)), Type::Float(FloatConstraint::Const(_))) |
-                        (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(prim))) => {
-                            // Polymorphic constant gets subsumed by specific primitive
-                            Type::Float(FloatConstraint::Any(*prim))
-                        }
-                        (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b))) if a == b => {
-                            // Identical constants merge
-                            Type::Float(FloatConstraint::Const(*a))
-                        }
-                        (Type::Error(linner), Type::Error(rinner)) => {
-                            let merged_contents = Type::make_union(vec![
-                                Arc::try_unwrap(linner.clone())
-                                    .unwrap_or_else(|arc| (*arc).clone()),
-                                Arc::try_unwrap(rinner.clone())
-                                    .unwrap_or_else(|arc| (*arc).clone()),
-                            ]);
-                            Type::Error(Arc::new(merged_contents))
-                        }
-                        _ => unreachable!(),
-                    };
+                if let Some(merged_type) = merged {
+                    types[write_pos] = merged_type;
                     // Continue reading without advancing write_pos
                 } else {
                     // Can't merge, advance write position and copy
@@ -792,7 +795,7 @@ mod tests {
         ]);
         assert_eq!(result, Type::Bool(BoolConstraint::Any));
 
-        // Test Bool(true) ∪ Bool(false) = Bool(Any)  
+        // Test Bool(true) ∪ Bool(false) = Bool(Any)
         let result = Type::make_union(vec![
             Type::Bool(BoolConstraint::Const(true)),
             Type::Bool(BoolConstraint::Const(false)),
@@ -810,7 +813,7 @@ mod tests {
     #[test]
     fn test_float_union_merging() {
         use ordered_float::OrderedFloat;
-        
+
         // Test Float(Any(F32)) ∪ Float(Const(2.5)) = Float(Any(F32))
         let result = Type::make_union(vec![
             Type::Float(FloatConstraint::Any(FloatPrim::F32)),
@@ -823,7 +826,10 @@ mod tests {
             Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
             Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
         ]);
-        assert_eq!(result, Type::Float(FloatConstraint::Const(OrderedFloat(2.5))));
+        assert_eq!(
+            result,
+            Type::Float(FloatConstraint::Const(OrderedFloat(2.5)))
+        );
 
         // Test Float(Const(2.5)) ∪ Float(Const(3.7)) = Union (distinct constants stay separate)
         let result = Type::make_union(vec![
@@ -843,10 +849,13 @@ mod tests {
     #[test]
     fn test_error_subtract() {
         // Error(A) - Error(B) → Error(A - B)
-        let error_union = Type::Error(Arc::new(Type::make_union(vec![Type::I32, Type::Bool(BoolConstraint::Any)])));
+        let error_union = Type::Error(Arc::new(Type::make_union(vec![
+            Type::I32,
+            Type::Bool(BoolConstraint::Any),
+        ])));
         let error_i32 = Type::Error(Arc::new(Type::I32));
         let result = error_union.subtract(&error_i32);
-        
+
         match result {
             Type::Error(inner) => {
                 assert_eq!(*inner, Type::Bool(BoolConstraint::Any)); // Union([I32, Bool]) - I32 = Bool
@@ -858,7 +867,7 @@ mod tests {
         let result = error_i32.subtract(&Type::Bool(BoolConstraint::Any));
         assert_eq!(result, error_i32);
 
-        // A - Error(B) → A (unchanged) 
+        // A - Error(B) → A (unchanged)
         let result = Type::I32.subtract(&error_i32);
         assert_eq!(result, Type::I32);
 
