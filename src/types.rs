@@ -169,6 +169,20 @@ impl Type {
                         // Adjacent or overlapping with overflow protection
                         lc.max.saturating_add(1) >= rc.min
                     }
+                    (Type::Bool(_), Type::Bool(_)) => {
+                        // Always merge Bool types - Any subsumes Const
+                        true
+                    }
+                    (Type::Float(FloatConstraint::Any(_prim)), Type::Float(FloatConstraint::Const(_))) |
+                    (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(_prim))) => {
+                        // Float primitive with polymorphic constant - can merge if constant fits
+                        // TODO: check if constant fits in primitive range
+                        true
+                    }
+                    (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b))) => {
+                        // Two float constants - only merge if identical
+                        a == b
+                    }
                     (Type::Error(_), Type::Error(_)) => {
                         // Always merge adjacent errors
                         true
@@ -184,6 +198,23 @@ impl Type {
                         }
                         (Type::UInt(prim, lc), Type::UInt(_, rc)) => {
                             Type::UInt(*prim, UIntConstraint::new(lc.min, lc.max.max(rc.max)))
+                        }
+                        (Type::Bool(lc), Type::Bool(rc)) => {
+                            // Any Bool constraint subsumes more specific ones
+                            match (lc, rc) {
+                                (BoolConstraint::Any, _) | (_, BoolConstraint::Any) => Type::Bool(BoolConstraint::Any),
+                                (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => Type::Bool(*lc),
+                                (BoolConstraint::Const(_), BoolConstraint::Const(_)) => Type::Bool(BoolConstraint::Any), // true ∪ false = Any
+                            }
+                        }
+                        (Type::Float(FloatConstraint::Any(prim)), Type::Float(FloatConstraint::Const(_))) |
+                        (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(prim))) => {
+                            // Polymorphic constant gets subsumed by specific primitive
+                            Type::Float(FloatConstraint::Any(*prim))
+                        }
+                        (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b))) if a == b => {
+                            // Identical constants merge
+                            Type::Float(FloatConstraint::Const(*a))
                         }
                         (Type::Error(linner), Type::Error(rinner)) => {
                             let merged_contents = Type::make_union(vec![
@@ -750,6 +781,63 @@ mod tests {
         // A ∩ Error(B) → Never
         let result = Type::I32.intersect(&error_i32);
         assert_eq!(result, Type::Never);
+    }
+
+    #[test]
+    fn test_bool_union_merging() {
+        // Test Bool(Any) ∪ Bool(true) = Bool(Any)
+        let result = Type::make_union(vec![
+            Type::Bool(BoolConstraint::Any),
+            Type::Bool(BoolConstraint::Const(true)),
+        ]);
+        assert_eq!(result, Type::Bool(BoolConstraint::Any));
+
+        // Test Bool(true) ∪ Bool(false) = Bool(Any)  
+        let result = Type::make_union(vec![
+            Type::Bool(BoolConstraint::Const(true)),
+            Type::Bool(BoolConstraint::Const(false)),
+        ]);
+        assert_eq!(result, Type::Bool(BoolConstraint::Any));
+
+        // Test Bool(true) ∪ Bool(true) = Bool(true)
+        let result = Type::make_union(vec![
+            Type::Bool(BoolConstraint::Const(true)),
+            Type::Bool(BoolConstraint::Const(true)),
+        ]);
+        assert_eq!(result, Type::Bool(BoolConstraint::Const(true)));
+    }
+
+    #[test]
+    fn test_float_union_merging() {
+        use ordered_float::OrderedFloat;
+        
+        // Test Float(Any(F32)) ∪ Float(Const(2.5)) = Float(Any(F32))
+        let result = Type::make_union(vec![
+            Type::Float(FloatConstraint::Any(FloatPrim::F32)),
+            Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
+        ]);
+        assert_eq!(result, Type::Float(FloatConstraint::Any(FloatPrim::F32)));
+
+        // Test Float(Const(2.5)) ∪ Float(Const(2.5)) = Float(Const(2.5))
+        let result = Type::make_union(vec![
+            Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
+            Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
+        ]);
+        assert_eq!(result, Type::Float(FloatConstraint::Const(OrderedFloat(2.5))));
+
+        // Test Float(Const(2.5)) ∪ Float(Const(3.7)) = Union (distinct constants stay separate)
+        let result = Type::make_union(vec![
+            Type::Float(FloatConstraint::Const(OrderedFloat(2.5))),
+            Type::Float(FloatConstraint::Const(OrderedFloat(3.7))),
+        ]);
+        match result {
+            Type::Union(types) => {
+                assert_eq!(types.len(), 2);
+                assert!(types.contains(&Type::Float(FloatConstraint::Const(OrderedFloat(2.5)))));
+                assert!(types.contains(&Type::Float(FloatConstraint::Const(OrderedFloat(3.7)))));
+            }
+            _ => panic!("Expected union of distinct float constants"),
+        }
     }
 
     #[test]
