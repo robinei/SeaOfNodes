@@ -5,6 +5,18 @@ use ordered_float::OrderedFloat;
 use crate::IRError;
 use crate::constraints::*;
 
+// Private zero-sized type to prevent direct construction of Union/Error
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Priv {
+    _private: (),
+}
+
+impl Priv {
+    fn new() -> Self {
+        Priv { _private: () }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 enum ArithmeticOp {
     Add,
@@ -28,9 +40,9 @@ pub enum Type {
     UInt(UIntPrim, UIntConstraint),
     Float(FloatConstraint),
 
-    Union(Arc<[Type]>),
+    Union(Arc<[Type]>, Priv),
 
-    Error(Arc<Type>),
+    Error(Arc<Type>, Priv),
 }
 
 impl Type {
@@ -84,13 +96,13 @@ impl Type {
                 // Identical constants merge
                 Some(Type::Float(FloatConstraint::Const(*a)))
             }
-            (Type::Error(linner), Type::Error(rinner)) => {
-                // Always merge adjacent errors
+            (Type::Error(linner, ..), Type::Error(rinner, ..)) => {
+                // Always merge adjacent errors by creating Error(Union([contents]))
                 let merged_contents = Type::make_union(vec![
                     Arc::try_unwrap(linner.clone()).unwrap_or_else(|arc| (*arc).clone()),
                     Arc::try_unwrap(rinner.clone()).unwrap_or_else(|arc| (*arc).clone()),
                 ]);
-                Some(Type::Error(Arc::new(merged_contents)))
+                Some(Type::Error(Arc::new(merged_contents), Priv::new()))
             }
             _ => None, // Can't merge
         }
@@ -126,14 +138,14 @@ impl Type {
                 };
                 Ok(Type::Float(result))
             }
-            (Type::Union(types), other) => {
+            (Type::Union(types, ..), other) => {
                 let results: Result<Vec<_>, _> = types
                     .iter()
                     .map(|t| t.apply_arithmetic_op(other, op))
                     .collect();
                 Ok(Self::make_union(results?))
             }
-            (other, Type::Union(types)) => {
+            (other, Type::Union(types, ..)) => {
                 let results: Result<Vec<_>, _> = types
                     .iter()
                     .map(|t| other.apply_arithmetic_op(t, op))
@@ -157,43 +169,13 @@ impl Type {
     pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
 
-    pub fn normalize(self) -> Type {
-        match self {
-            Type::Error(inner) => {
-                let normalized_inner = Arc::try_unwrap(inner)
-                    .unwrap_or_else(|arc| (*arc).clone())
-                    .normalize();
-
-                match normalized_inner {
-                    Type::Never => Type::Never,
-                    Type::Error(deeper) => Type::Error(deeper), // Unwrap nested
-                    Type::Union(types) => {
-                        // Distribute: Error(Union([A, B])) → make_union([Error(A), Error(B)])
-                        let error_types: Vec<Type> = types
-                            .iter()
-                            .map(|t| Type::Error(Arc::new(t.clone())))
-                            .collect();
-                        Type::make_union(error_types) // Will handle Error merging
-                    }
-                    other => Type::Error(Arc::new(other)),
-                }
-            }
-            Type::Union(types) => {
-                // Normalize each member first, then make_union
-                let normalized: Vec<Type> = types.iter().map(|t| t.clone().normalize()).collect();
-                Type::make_union(normalized)
-            }
-            other => other, // Already normalized
-        }
-    }
-
     pub fn make_union(mut types: Vec<Type>) -> Type {
         // Flatten nested unions in-place
         let mut i = 0;
         while i < types.len() {
-            if let Type::Union(_) = &types[i] {
+            if let Type::Union(..) = &types[i] {
                 let union_type = std::mem::replace(&mut types[i], Type::Unit);
-                if let Type::Union(inner_types) = union_type {
+                if let Type::Union(inner_types, ..) = union_type {
                     assert!(
                         !inner_types.is_empty(),
                         "unions should never be empty, by construction"
@@ -247,7 +229,21 @@ impl Type {
         match types.len() {
             0 => Type::Never,
             1 => types.into_iter().next().unwrap(),
-            _ => Type::Union(types.into()),
+            _ => Type::Union(types.into(), Priv::new()),
+        }
+    }
+
+    pub fn make_error(inner: Type) -> Type {
+        match inner {
+            Type::Never => Type::Never,
+            Type::Error(..) => inner,
+            Type::Union(types, ..) => {
+                // Distribute: Error(Union([A, B])) → make_union([Error(A), Error(B)])
+                let error_types: Vec<Type> =
+                    types.iter().map(|t| Type::make_error(t.clone())).collect();
+                Type::make_union(error_types) // Will handle Error merging
+            }
+            other => Type::Error(Arc::new(other), Priv::new()),
         }
     }
 
@@ -299,19 +295,19 @@ impl Type {
             },
 
             // Error intersections
-            (Type::Error(la), Type::Error(ra)) => {
+            (Type::Error(la, ..), Type::Error(ra, ..)) => {
                 let inner_intersection = (**la).clone().intersect(&(**ra));
                 match inner_intersection {
                     Type::Never => Type::Never,
-                    other => Type::Error(Arc::new(other)),
+                    other => Type::make_error(other),
                 }
             }
 
-            (Type::Error(_), _) => Type::Never, // Error ∩ non-error = Never
-            (_, Type::Error(_)) => Type::Never, // non-error ∩ Error = Never
+            (Type::Error(..), _) => Type::Never, // Error ∩ non-error = Never
+            (_, Type::Error(..)) => Type::Never, // non-error ∩ Error = Never
 
             // Union intersections
-            (Type::Union(types), other) => {
+            (Type::Union(types, ..), other) => {
                 let intersected: Vec<Type> = types
                     .iter()
                     .map(|t| t.intersect(other))
@@ -320,7 +316,7 @@ impl Type {
                 Type::make_union(intersected)
             }
 
-            (other, Type::Union(types)) => Type::Union(types.clone()).intersect(other),
+            (other, Type::Union(types, ..)) => other.intersect(&Type::make_union(types.to_vec())),
 
             // Exact same type → return self
             (a, b) if a == b => self.clone(),
@@ -389,19 +385,19 @@ impl Type {
             }
 
             // Error subtraction
-            (Type::Error(la), Type::Error(ra)) => {
+            (Type::Error(la, ..), Type::Error(ra, ..)) => {
                 let inner_subtraction = (**la).clone().subtract(&(**ra));
                 match inner_subtraction {
                     Type::Never => Type::Never,
-                    other => Type::Error(Arc::new(other)),
+                    other => Type::make_error(other),
                 }
             }
 
-            (Type::Error(_), _) => self.clone(), // Error - non-error = Error (unchanged)
-            (_, Type::Error(_)) => self.clone(), // non-error - Error = non-error (unchanged)
+            (Type::Error(..), _) => self.clone(), // Error - non-error = Error (unchanged)
+            (_, Type::Error(..)) => self.clone(), // non-error - Error = non-error (unchanged)
 
             // Union subtraction
-            (Type::Union(types), other) => {
+            (Type::Union(types, ..), other) => {
                 let subtracted: Vec<Type> = types
                     .iter()
                     .map(|t| t.subtract(other))
@@ -437,12 +433,12 @@ impl Type {
             }
             (Type::Float(lc), Type::Float(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
             (Type::Bool(lc), Type::Bool(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
-            (Type::Union(types), other) => {
+            (Type::Union(types, ..), other) => {
                 let results: Result<Vec<_>, _> =
                     types.iter().map(|t| t.compare(other, op)).collect();
                 Ok(Self::make_union(results?))
             }
-            (other, Type::Union(types)) => {
+            (other, Type::Union(types, ..)) => {
                 let results: Result<Vec<_>, _> =
                     types.iter().map(|t| other.compare(t, op)).collect();
                 Ok(Self::make_union(results?))
@@ -612,7 +608,7 @@ mod tests {
         ]);
 
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
                 assert!(!types.iter().any(|t| matches!(t, Type::Never)));
             }
@@ -647,7 +643,7 @@ mod tests {
         ]);
 
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
                 assert_eq!(types[0], Type::Int(IntPrim::I32, IntConstraint::new(1, 3)));
                 assert_eq!(types[1], Type::Int(IntPrim::I32, IntConstraint::new(7, 9)));
@@ -659,15 +655,15 @@ mod tests {
     #[test]
     fn test_make_union_nested_flattening() {
         // Nested unions should be flattened
-        let inner_union = Type::Union(Arc::new([Type::I32, Type::Bool(BoolConstraint::Any)]));
+        let inner_union = Type::make_union(vec![Type::I32, Type::Bool(BoolConstraint::Any)]);
 
         let result = Type::make_union(vec![Type::I64, inner_union, Type::F32]);
 
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 4);
                 // Should contain all flattened types, no nested unions
-                assert!(!types.iter().any(|t| matches!(t, Type::Union(_))));
+                assert!(!types.iter().any(|t| matches!(t, Type::Union(..))));
             }
             _ => panic!("Expected flattened union"),
         }
@@ -684,7 +680,7 @@ mod tests {
         ]);
 
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
                 // Should be sorted: Bool < Int
                 assert!(matches!(types[0], Type::Bool(_)));
@@ -697,10 +693,10 @@ mod tests {
     #[test]
     fn test_make_union_complex_case() {
         // Complex case: nested unions + Never + overlapping ranges + Any
-        let nested = Type::Union(Arc::new([
+        let nested = Type::make_union(vec![
             Type::Int(IntPrim::I32, IntConstraint::new(10, 15)),
             Type::Never,
-        ]));
+        ]);
 
         let result = Type::make_union(vec![
             Type::Int(IntPrim::I32, IntConstraint::new(1, 5)),
@@ -718,27 +714,27 @@ mod tests {
     #[test]
     fn test_error_normalization() {
         // Test Error(Never) → Never
-        let result = Type::Error(Arc::new(Type::Never)).normalize();
+        let result = Type::make_error(Type::Never);
         assert_eq!(result, Type::Never);
 
         // Test Error(Error(T)) → Error(T)
-        let inner_error = Type::Error(Arc::new(Type::I32));
-        let nested_error = Type::Error(Arc::new(inner_error));
-        let result = nested_error.normalize();
-        assert_eq!(result, Type::Error(Arc::new(Type::I32)));
+        let inner_error = Type::make_error(Type::I32);
+        let nested_error = Type::make_error(inner_error);
+        let result = nested_error;
+        assert_eq!(result, Type::make_error(Type::I32));
     }
 
     #[test]
     fn test_error_merging_in_unions() {
         // Test Union([Error(A), Error(B)]) → Error(Union([A, B]))
         let result = Type::make_union(vec![
-            Type::Error(Arc::new(Type::I32)),
-            Type::Error(Arc::new(Type::Bool(BoolConstraint::Any))),
+            Type::make_error(Type::I32),
+            Type::make_error(Type::Bool(BoolConstraint::Any)),
         ]);
 
         match result {
-            Type::Error(inner) => match &*inner {
-                Type::Union(types) => {
+            Type::Error(inner, ..) => match &*inner {
+                Type::Union(types, ..) => {
                     assert_eq!(types.len(), 2);
                     assert!(types.contains(&Type::Bool(BoolConstraint::Any)));
                     assert!(types.contains(&Type::I32));
@@ -751,14 +747,14 @@ mod tests {
         // Test mixed union: Union([A, Error(B)]) stays as-is
         let result = Type::make_union(vec![
             Type::I32,
-            Type::Error(Arc::new(Type::Bool(BoolConstraint::Any))),
+            Type::make_error(Type::Bool(BoolConstraint::Any)),
         ]);
 
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
                 assert!(types.contains(&Type::I32));
-                assert!(types.contains(&Type::Error(Arc::new(Type::Bool(BoolConstraint::Any)))));
+                assert!(types.contains(&Type::make_error(Type::Bool(BoolConstraint::Any))));
             }
             _ => panic!("Expected Union with mixed types"),
         }
@@ -767,15 +763,15 @@ mod tests {
     #[test]
     fn test_error_intersect() {
         // Error(A) ∩ Error(B) → Error(A ∩ B)
-        let error_i32 = Type::Error(Arc::new(Type::I32));
-        let error_bool = Type::Error(Arc::new(Type::Bool(BoolConstraint::Any)));
+        let error_i32 = Type::make_error(Type::I32);
+        let error_bool = Type::make_error(Type::Bool(BoolConstraint::Any));
         let result = error_i32.intersect(&error_bool);
         assert_eq!(result, Type::Never); // I32 ∩ Bool = Never, so Error(Never) = Never
 
         // Error(A) ∩ Error(A) → Error(A)
-        let error_i32_2 = Type::Error(Arc::new(Type::I32));
+        let error_i32_2 = Type::make_error(Type::I32);
         let result = error_i32.intersect(&error_i32_2);
-        assert_eq!(result, Type::Error(Arc::new(Type::I32)));
+        assert_eq!(result, Type::make_error(Type::I32));
 
         // Error(A) ∩ B → Never
         let result = error_i32.intersect(&Type::I32);
@@ -837,7 +833,7 @@ mod tests {
             Type::Float(FloatConstraint::Const(OrderedFloat(3.7))),
         ]);
         match result {
-            Type::Union(types) => {
+            Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
                 assert!(types.contains(&Type::Float(FloatConstraint::Const(OrderedFloat(2.5)))));
                 assert!(types.contains(&Type::Float(FloatConstraint::Const(OrderedFloat(3.7)))));
@@ -849,15 +845,15 @@ mod tests {
     #[test]
     fn test_error_subtract() {
         // Error(A) - Error(B) → Error(A - B)
-        let error_union = Type::Error(Arc::new(Type::make_union(vec![
+        let error_union = Type::make_error(Type::make_union(vec![
             Type::I32,
             Type::Bool(BoolConstraint::Any),
-        ])));
-        let error_i32 = Type::Error(Arc::new(Type::I32));
+        ]));
+        let error_i32 = Type::make_error(Type::I32);
         let result = error_union.subtract(&error_i32);
 
         match result {
-            Type::Error(inner) => {
+            Type::Error(inner, ..) => {
                 assert_eq!(*inner, Type::Bool(BoolConstraint::Any)); // Union([I32, Bool]) - I32 = Bool
             }
             _ => panic!("Expected Error type"),

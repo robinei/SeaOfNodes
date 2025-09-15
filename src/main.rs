@@ -406,25 +406,25 @@ mod tests {
     #[test]
     fn test_arithmetic_constant_folding() {
         let mut builder = IRBuilder::new();
-        
+
         // Test add constant folding
         let a = Node::const_int(5);
         let b = Node::const_int(3);
         let result = builder.create_add(&a, &b).unwrap();
-        
+
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(8));
-        
+
         // Test sub constant folding
         let result = builder.create_sub(&a, &b).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(2));
-        
+
         // Test mul constant folding
         let result = builder.create_mul(&a, &b).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(15));
-        
+
         // Test div constant folding
         let result = builder.create_div(&a, &b).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
@@ -434,50 +434,50 @@ mod tests {
     #[test]
     fn test_arithmetic_peepholes() {
         let mut builder = IRBuilder::new();
-        
+
         let x = Node::create_param(0, Type::I32);
         let zero = Node::const_int(0);
         let one = Node::const_int(1);
-        
+
         // Test x + 0 => x
         let result = builder.create_add(&x, &zero).unwrap();
         assert_eq!(result, x);
-        
+
         // Test 0 + x => x
         let result = builder.create_add(&zero, &x).unwrap();
         assert_eq!(result, x);
-        
+
         // Test x - 0 => x
         let result = builder.create_sub(&x, &zero).unwrap();
         assert_eq!(result, x);
-        
+
         // Test x - x => 0
         let result = builder.create_sub(&x, &x).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(0));
-        
+
         // Test x * 1 => x
         let result = builder.create_mul(&x, &one).unwrap();
         assert_eq!(result, x);
-        
+
         // Test 1 * x => x
         let result = builder.create_mul(&one, &x).unwrap();
         assert_eq!(result, x);
-        
+
         // Test x * 0 => 0
         let result = builder.create_mul(&x, &zero).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(0));
-        
+
         // Test x / 1 => x
         let result = builder.create_div(&x, &one).unwrap();
         assert_eq!(result, x);
-        
+
         // Test x / x => 1
         let result = builder.create_div(&x, &x).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_int(), Some(1));
-        
+
         // Test 0 / x => 0
         let result = builder.create_div(&zero, &x).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
@@ -487,17 +487,17 @@ mod tests {
     #[test]
     fn test_arithmetic_algebraic_peepholes() {
         let mut builder = IRBuilder::new();
-        
+
         let x = Node::create_param(0, Type::I32);
         let two = Node::const_int(2);
-        
+
         // Test x + x => x * 2 (from create_add)
         let result = builder.create_add(&x, &x).unwrap();
         assert_eq!(result.kind, NodeKind::Mul);
-        // Should be x * 2  
+        // Should be x * 2
         let mul_rhs = builder.lookup(result.get_input(2)); // Right operand is at index 2
         assert_eq!(mul_rhs.t.get_const_int(), Some(2));
-        
+
         // Test double negation: x - (-y) => x + y
         let mut neg_x = Node::new(NodeKind::Neg, Type::I32);
         neg_x.set_inputs(&[0, builder.intern(&x)]); // 0 = no control, x as operand
@@ -508,23 +508,23 @@ mod tests {
     #[test]
     fn test_range_based_constant_folding() {
         // Test that operations on constrained ranges can constant fold
-        
+
         // Range [5, 5] + Range [3, 3] should fold to const 8
         let constraint_5 = IntConstraint::new(5, 5);
         let constraint_3 = IntConstraint::new(3, 3);
         let type_5 = Type::Int(IntPrim::I64, constraint_5);
         let type_3 = Type::Int(IntPrim::I64, constraint_3);
-        
+
         let result = type_5.add(&type_3).unwrap();
         assert!(result.is_const());
         assert_eq!(result.get_const_int(), Some(8));
-        
+
         // Range [1, 10] + Range [5, 5] should give Range [6, 15]
         let range_1_10 = IntConstraint::new(1, 10);
         let const_5 = IntConstraint::new(5, 5);
         let type_range = Type::Int(IntPrim::I64, range_1_10);
         let type_const = Type::Int(IntPrim::I64, const_5);
-        
+
         let result = type_range.add(&type_const).unwrap();
         match result {
             Type::Int(IntPrim::I64, constraint) => {
@@ -538,16 +538,16 @@ mod tests {
     #[test]
     fn test_arithmetic_overflow_handling() {
         // Test that overflow is properly detected and handled
-        
+
         // i8::MAX + 1 should error when we have constants
         let max_i8 = IntConstraint::new(127, 127); // i8::MAX
         let one = IntConstraint::new(1, 1);
         let max_type = Type::Int(IntPrim::I8, max_i8);
         let one_type = Type::Int(IntPrim::I64, one); // Untyped constant
-        
+
         let result = max_type.add(&one_type);
         assert!(result.is_err()); // Should error due to provable overflow
-        
+
         // Full range + full range should not error (runtime case)
         let full_i8 = Type::prim_int(IntPrim::I8);
         let result = full_i8.add(&full_i8);
@@ -557,16 +557,16 @@ mod tests {
     #[test]
     fn test_division_by_zero_handling() {
         // Test division by zero detection
-        
+
         let five = IntConstraint::new(5, 5);
         let zero = IntConstraint::new(0, 0);
         let five_type = Type::Int(IntPrim::I64, five);
         let zero_type = Type::Int(IntPrim::I64, zero);
-        
+
         // 5 / 0 should error
         let result = five_type.div(&zero_type);
         assert!(result.is_err());
-        
+
         // 5 / range_including_zero should NOT error (possible but not definite division by zero)
         let range_with_zero = IntConstraint::new(-1, 1); // Includes 0
         let range_type = Type::Int(IntPrim::I64, range_with_zero);
@@ -577,30 +577,30 @@ mod tests {
     #[test]
     fn test_float_arithmetic() {
         let mut builder = IRBuilder::new();
-        
+
         // Test float constant folding
         let a = Node::const_float(2.5);
         let b = Node::const_float(1.5);
-        
+
         let result = builder.create_add(&a, &b).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_float(), Some(4.0));
-        
+
         let result = builder.create_mul(&a, &b).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_float(), Some(3.75));
-        
+
         // Test float peepholes
         let x = Node::create_param(0, Type::F64);
         let zero = Node::const_float(0.0);
         let one = Node::const_float(1.0);
-        
+
         // x * 0.0 => 0.0
         let result = builder.create_mul(&x, &zero).unwrap();
         assert_eq!(result.kind, NodeKind::Const);
         assert_eq!(result.t.get_const_float(), Some(0.0));
-        
-        // x / 1.0 => x  
+
+        // x / 1.0 => x
         let result = builder.create_div(&x, &one).unwrap();
         assert_eq!(result, x);
     }
@@ -610,18 +610,18 @@ mod tests {
         let int_node = Node::const_int(5);
         let float_node = Node::const_float(5.0);
         let bool_node = Node::const_bool(true);
-        
+
         // Test that mixed types properly error
         let int_type = int_node.t;
         let float_type = float_node.t;
         let bool_type = bool_node.t;
-        
+
         // int + float should error
         assert!(int_type.add(&float_type).is_err());
-        
+
         // int + bool should error
         assert!(int_type.add(&bool_type).is_err());
-        
+
         // float + bool should error
         assert!(float_type.add(&bool_type).is_err());
     }
