@@ -8,7 +8,7 @@ use crate::constraints::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastKind {
     Static,  // Guaranteed safe, no runtime check needed
-    Dynamic, // Possible but requires runtime type check  
+    Dynamic, // Possible but requires runtime type check
     Invalid, // Definitely impossible
 }
 
@@ -103,13 +103,10 @@ impl Type {
                 // Identical constants merge
                 Some(Type::Float(FloatConstraint::Const(*a)))
             }
-            (Type::Error(linner, ..), Type::Error(rinner, ..)) => {
-                // Always merge adjacent errors by creating Error(Union([contents]))
-                let merged_contents = Type::make_union(vec![
-                    Arc::try_unwrap(linner.clone()).unwrap_or_else(|arc| (*arc).clone()),
-                    Arc::try_unwrap(rinner.clone()).unwrap_or_else(|arc| (*arc).clone()),
-                ]);
-                Some(Type::Error(Arc::new(merged_contents), Priv::new()))
+            (Type::Error(..), Type::Error(..)) => {
+                // Don't merge errors here - let make_union handle flattening
+                // This prevents nested Error(Union(...)) structures
+                None
             }
             _ => None, // Can't merge
         }
@@ -177,21 +174,46 @@ impl Type {
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
 
     pub fn make_union(mut types: Vec<Type>) -> Type {
-        // Flatten nested unions in-place
+        // Flatten nested unions and distribute errors over unions
         let mut i = 0;
         while i < types.len() {
-            if let Type::Union(..) = &types[i] {
-                let union_type = std::mem::replace(&mut types[i], Type::Unit);
-                if let Type::Union(inner_types, ..) = union_type {
-                    assert!(
-                        !inner_types.is_empty(),
-                        "unions should never be empty, by construction"
-                    );
-                    types[i] = inner_types[0].clone();
-                    for t in inner_types.iter().skip(1) {
-                        types.push(t.clone());
+            match &types[i] {
+                Type::Union(..) => {
+                    let union_type = std::mem::replace(&mut types[i], Type::Unit);
+                    if let Type::Union(inner_types, ..) = union_type {
+                        assert!(
+                            !inner_types.is_empty(),
+                            "unions should never be empty, by construction"
+                        );
+                        types[i] = inner_types[0].clone();
+                        for t in inner_types.iter().skip(1) {
+                            types.push(t.clone());
+                        }
                     }
                 }
+                Type::Error(inner, ..) => {
+                    // If we have Error(Union([A, B])), distribute to [Error(A), Error(B)]
+                    if let Type::Union(..) = &**inner {
+                        let error_type = std::mem::replace(&mut types[i], Type::Unit);
+                        let Type::Error(inner_content, ..) = error_type else {
+                            unreachable!()
+                        };
+                        let Type::Union(inner_types, ..) =
+                            Arc::try_unwrap(inner_content).unwrap_or_else(|arc| (*arc).clone())
+                        else {
+                            unreachable!()
+                        };
+
+                        // Replace current position with Error(first_type)
+                        types[i] = Type::Error(Arc::new(inner_types[0].clone()), Priv::new());
+
+                        // Push Error(remaining_types) directly
+                        for t in inner_types.iter().skip(1) {
+                            types.push(Type::Error(Arc::new(t.clone()), Priv::new()));
+                        }
+                    }
+                }
+                _ => {}
             }
             i += 1;
         }
@@ -246,9 +268,11 @@ impl Type {
             Type::Error(..) => inner,
             Type::Union(types, ..) => {
                 // Distribute: Error(Union([A, B])) → make_union([Error(A), Error(B)])
-                let error_types: Vec<Type> =
-                    types.iter().map(|t| Type::make_error(t.clone())).collect();
-                Type::make_union(error_types) // Will handle Error merging
+                let error_types: Vec<Type> = types
+                    .iter()
+                    .map(|t| Type::Error(Arc::new(t.clone()), Priv::new()))
+                    .collect();
+                Type::make_union(error_types) // This will place errors at tail
             }
             other => Type::Error(Arc::new(other), Priv::new()),
         }
@@ -602,13 +626,11 @@ impl Type {
 
         match (self, target_type) {
             // Signed to signed
-            (Type::Int(_, from_constraint), Type::Int(_, to_constraint)) => {
-                Self::range_cast_kind(
-                    CommonRange::from(*from_constraint),
-                    CommonRange::from(*to_constraint),
-                )
-            }
-            
+            (Type::Int(_, from_constraint), Type::Int(_, to_constraint)) => Self::range_cast_kind(
+                CommonRange::from(*from_constraint),
+                CommonRange::from(*to_constraint),
+            ),
+
             // Unsigned to unsigned
             (Type::UInt(_, from_constraint), Type::UInt(_, to_constraint)) => {
                 Self::range_cast_kind(
@@ -616,22 +638,18 @@ impl Type {
                     CommonRange::from(*to_constraint),
                 )
             }
-            
+
             // Signed to unsigned
-            (Type::Int(_, from_constraint), Type::UInt(_, to_constraint)) => {
-                Self::range_cast_kind(
-                    CommonRange::from(*from_constraint),
-                    CommonRange::from(*to_constraint),
-                )
-            }
-            
+            (Type::Int(_, from_constraint), Type::UInt(_, to_constraint)) => Self::range_cast_kind(
+                CommonRange::from(*from_constraint),
+                CommonRange::from(*to_constraint),
+            ),
+
             // Unsigned to signed
-            (Type::UInt(_, from_constraint), Type::Int(_, to_constraint)) => {
-                Self::range_cast_kind(
-                    CommonRange::from(*from_constraint),
-                    CommonRange::from(*to_constraint),
-                )
-            }
+            (Type::UInt(_, from_constraint), Type::Int(_, to_constraint)) => Self::range_cast_kind(
+                CommonRange::from(*from_constraint),
+                CommonRange::from(*to_constraint),
+            ),
 
             // Bool casts - write out all cases
             (Type::Bool(BoolConstraint::Const(a)), Type::Bool(BoolConstraint::Const(b))) => {
@@ -654,7 +672,7 @@ impl Type {
             // Union casts - check all possibilities
             (Type::Union(types, ..), target) => {
                 let cast_kinds: Vec<_> = types.iter().map(|t| t.cast_kind(target)).collect();
-                
+
                 if cast_kinds.iter().all(|&k| k == CastKind::Static) {
                     CastKind::Static // All members cast statically
                 } else if cast_kinds.iter().any(|&k| k == CastKind::Invalid) {
@@ -668,7 +686,10 @@ impl Type {
             (source, Type::Union(types, ..)) => {
                 if types.iter().any(|t| source == t) {
                     CastKind::Static // Source is already a union member
-                } else if types.iter().any(|t| source.cast_kind(t) != CastKind::Invalid) {
+                } else if types
+                    .iter()
+                    .any(|t| source.cast_kind(t) != CastKind::Invalid)
+                {
                     CastKind::Dynamic // Source can cast to at least one member
                 } else {
                     CastKind::Invalid // Source can't cast to any member
@@ -844,25 +865,30 @@ mod tests {
 
     #[test]
     fn test_error_merging_in_unions() {
-        // Test Union([Error(A), Error(B)]) → Error(Union([A, B]))
+        // Test Union([Error(A), Error(B)]) → Union([Error(A), Error(B)]) (individual errors)
         let result = Type::make_union(vec![
             Type::make_error(Type::I32),
             Type::make_error(Type::Bool(BoolConstraint::Any)),
         ]);
 
         match result {
-            Type::Error(inner, ..) => match &*inner {
-                Type::Union(types, ..) => {
-                    assert_eq!(types.len(), 2);
-                    assert!(types.contains(&Type::Bool(BoolConstraint::Any)));
-                    assert!(types.contains(&Type::I32));
+            Type::Union(types, ..) => {
+                assert_eq!(types.len(), 2);
+                // Both should be individual Error types
+                assert!(matches!(types[0], Type::Error(..)));
+                assert!(matches!(types[1], Type::Error(..)));
+
+                // Extract and verify inner types
+                if let (Type::Error(inner1, ..), Type::Error(inner2, ..)) = (&types[0], &types[1]) {
+                    let inner_types = vec![(&**inner1).clone(), (&**inner2).clone()];
+                    assert!(inner_types.contains(&Type::Bool(BoolConstraint::Any)));
+                    assert!(inner_types.contains(&Type::I32));
                 }
-                _ => panic!("Expected Error(Union(...))"),
-            },
-            _ => panic!("Expected Error type"),
+            }
+            _ => panic!("Expected Union with individual Error types"),
         }
 
-        // Test mixed union: Union([A, Error(B)]) stays as-is
+        // Test mixed union: Union([A, Error(B)]) - errors sort to the end
         let result = Type::make_union(vec![
             Type::I32,
             Type::make_error(Type::Bool(BoolConstraint::Any)),
@@ -871,8 +897,12 @@ mod tests {
         match result {
             Type::Union(types, ..) => {
                 assert_eq!(types.len(), 2);
-                assert!(types.contains(&Type::I32));
-                assert!(types.contains(&Type::make_error(Type::Bool(BoolConstraint::Any))));
+                assert_eq!(types[0], Type::I32); // Regular type comes first
+                assert!(matches!(types[1], Type::Error(..))); // Error type at tail
+
+                if let Type::Error(inner, ..) = &types[1] {
+                    assert_eq!(**inner, Type::Bool(BoolConstraint::Any));
+                }
             }
             _ => panic!("Expected Union with mixed types"),
         }
@@ -962,20 +992,35 @@ mod tests {
 
     #[test]
     fn test_error_subtract() {
-        // Error(A) - Error(B) → Error(A - B)
+        // With new flattening: make_error(Union([I32, Bool])) creates Union([Error(I32), Error(Bool)])
+        // So we need to test subtraction on individual error types in the union
         let error_union = Type::make_error(Type::make_union(vec![
             Type::I32,
             Type::Bool(BoolConstraint::Any),
         ]));
-        let error_i32 = Type::make_error(Type::I32);
-        let result = error_union.subtract(&error_i32);
 
-        match result {
-            Type::Error(inner, ..) => {
-                assert_eq!(*inner, Type::Bool(BoolConstraint::Any)); // Union([I32, Bool]) - I32 = Bool
+        // This creates Union([Error(I32), Error(Bool)]) due to flattening
+        match error_union {
+            Type::Union(types, ..) => {
+                assert_eq!(types.len(), 2);
+                let error_i32 = Type::make_error(Type::I32);
+
+                // Test subtract on the first error type (should be Error(I32) or Error(Bool))
+                let result = types[0].subtract(&error_i32);
+                // Error(I32) - Error(I32) = Never, Error(Bool) - Error(I32) = Error(Bool)
+                if let Type::Error(inner, ..) = &types[0] {
+                    if **inner == Type::I32 {
+                        assert_eq!(result, Type::Never);
+                    } else {
+                        assert_eq!(result, types[0].clone()); // Error(Bool) unchanged
+                    }
+                }
             }
-            _ => panic!("Expected Error type"),
+            _ => panic!("Expected Union type due to flattening"),
         }
+
+        // Test simple error subtraction
+        let error_i32 = Type::make_error(Type::I32);
 
         // Error(A) - B → Error(A) (unchanged)
         let result = error_i32.subtract(&Type::Bool(BoolConstraint::Any));

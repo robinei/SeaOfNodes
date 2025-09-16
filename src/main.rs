@@ -717,4 +717,45 @@ mod tests {
         assert!(cast_result.is_err());
         assert_eq!(cast_result.unwrap_err(), IRError::TypeMismatch);
     }
+
+    #[test]
+    fn test_union_error_flattening() {
+        use crate::types::*;
+        
+        // Create two basic types
+        let int_type = Type::I32;
+        let bool_type = Type::BOOL;
+        
+        // Create a union of these types
+        let union_type = Type::make_union(vec![int_type.clone(), bool_type.clone()]);
+        
+        // Create an Error wrapping this union - this should get flattened
+        let error_union = Type::make_error(union_type);
+        
+        // Create another union that includes this Error(Union(...))
+        let outer_union = Type::make_union(vec![Type::Unit, error_union]);
+        
+        // Verify the result: should be Union([Unit, Error(I32), Error(Bool)]) 
+        // with errors at the tail
+        if let Type::Union(types, ..) = outer_union {
+            assert_eq!(types.len(), 3);
+            assert_eq!(types[0], Type::Unit);
+            
+            // The errors should be at the tail
+            assert!(matches!(types[1], Type::Error(..)));
+            assert!(matches!(types[2], Type::Error(..)));
+            
+            // Extract inner types from errors to verify they are I32 and Bool
+            if let (Type::Error(inner1, ..), Type::Error(inner2, ..)) = (&types[1], &types[2]) {
+                let inner_types = vec![(&**inner1).clone(), (&**inner2).clone()];
+                // Should contain both original types (order doesn't matter due to sorting)
+                assert!(inner_types.contains(&int_type));
+                assert!(inner_types.contains(&bool_type));
+            } else {
+                panic!("Expected Error types at positions 1 and 2");
+            }
+        } else {
+            panic!("Expected Union type, got {:?}", outer_union);
+        }
+    }
 }
