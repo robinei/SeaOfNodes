@@ -461,3 +461,43 @@ impl FloatConstraint {
 // Type aliases for convenience
 pub type IntConstraint = RangeConstraint<i64>;
 pub type UIntConstraint = RangeConstraint<u64>;
+
+// Common range type for comparison across signed/unsigned boundaries
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CommonRange {
+    pub min: i128,
+    pub max: i128,
+}
+
+impl CommonRange {
+    pub fn new(min: i128, max: i128) -> Self {
+        Self { min, max }
+    }
+    
+    /// Check if self completely contains other
+    pub fn contains(&self, other: &Self) -> bool {
+        self.min <= other.min && self.max >= other.max
+    }
+    
+    /// Check if self overlaps with other
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.max >= other.min && self.min <= other.max
+    }
+    
+    /// Check if self is disjoint from other
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        !self.overlaps(other)
+    }
+}
+
+impl From<IntConstraint> for CommonRange {
+    fn from(constraint: IntConstraint) -> Self {
+        Self::new(constraint.min as i128, constraint.max as i128)
+    }
+}
+
+impl From<UIntConstraint> for CommonRange {
+    fn from(constraint: UIntConstraint) -> Self {
+        Self::new(constraint.min as i128, constraint.max as i128)
+    }
+}

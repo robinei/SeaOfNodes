@@ -5,6 +5,13 @@ use ordered_float::OrderedFloat;
 use crate::IRError;
 use crate::constraints::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastKind {
+    Static,  // Guaranteed safe, no runtime check needed
+    Dynamic, // Possible but requires runtime type check  
+    Invalid, // Definitely impossible
+}
+
 // Private zero-sized type to prevent direct construction of Union/Error
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Priv {
@@ -572,6 +579,117 @@ impl Type {
         match self {
             Self::Float(c) => c.get_const_value(),
             _ => None,
+        }
+    }
+
+    /// Helper function to determine cast kind based on range relationships
+    fn range_cast_kind(from_range: CommonRange, to_range: CommonRange) -> CastKind {
+        if to_range.contains(&from_range) {
+            CastKind::Static // Source range ⊆ target range
+        } else if from_range.is_disjoint(&to_range) {
+            CastKind::Invalid // Ranges are disjoint
+        } else {
+            CastKind::Dynamic // Ranges overlap but source not contained in target
+        }
+    }
+
+    /// Determine what kind of cast is needed from self to target_type
+    pub fn cast_kind(&self, target_type: &Type) -> CastKind {
+        // Identity cast - always static
+        if self == target_type {
+            return CastKind::Static;
+        }
+
+        match (self, target_type) {
+            // Signed to signed
+            (Type::Int(_, from_constraint), Type::Int(_, to_constraint)) => {
+                Self::range_cast_kind(
+                    CommonRange::from(*from_constraint),
+                    CommonRange::from(*to_constraint),
+                )
+            }
+            
+            // Unsigned to unsigned
+            (Type::UInt(_, from_constraint), Type::UInt(_, to_constraint)) => {
+                Self::range_cast_kind(
+                    CommonRange::from(*from_constraint),
+                    CommonRange::from(*to_constraint),
+                )
+            }
+            
+            // Signed to unsigned
+            (Type::Int(_, from_constraint), Type::UInt(_, to_constraint)) => {
+                Self::range_cast_kind(
+                    CommonRange::from(*from_constraint),
+                    CommonRange::from(*to_constraint),
+                )
+            }
+            
+            // Unsigned to signed
+            (Type::UInt(_, from_constraint), Type::Int(_, to_constraint)) => {
+                Self::range_cast_kind(
+                    CommonRange::from(*from_constraint),
+                    CommonRange::from(*to_constraint),
+                )
+            }
+
+            // Bool casts - write out all cases
+            (Type::Bool(BoolConstraint::Const(a)), Type::Bool(BoolConstraint::Const(b))) => {
+                if a == b {
+                    CastKind::Static // Same constant
+                } else {
+                    CastKind::Invalid // Different constants (true ≠ false)
+                }
+            }
+            (Type::Bool(BoolConstraint::Const(_)), Type::Bool(BoolConstraint::Any)) => {
+                CastKind::Static // Const to Any is widening
+            }
+            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Const(_))) => {
+                CastKind::Dynamic // Any to Const needs runtime check
+            }
+            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Any)) => {
+                CastKind::Static // Any to Any (already handled by identity check above)
+            }
+
+            // Union casts - check all possibilities
+            (Type::Union(types, ..), target) => {
+                let cast_kinds: Vec<_> = types.iter().map(|t| t.cast_kind(target)).collect();
+                
+                if cast_kinds.iter().all(|&k| k == CastKind::Static) {
+                    CastKind::Static // All members cast statically
+                } else if cast_kinds.iter().any(|&k| k == CastKind::Invalid) {
+                    CastKind::Invalid // Some members can't cast at all
+                } else {
+                    CastKind::Dynamic // Mix of static and dynamic, or all dynamic
+                }
+            }
+
+            // Cast to union - static if source is a member
+            (source, Type::Union(types, ..)) => {
+                if types.iter().any(|t| source == t) {
+                    CastKind::Static // Source is already a union member
+                } else if types.iter().any(|t| source.cast_kind(t) != CastKind::Invalid) {
+                    CastKind::Dynamic // Source can cast to at least one member
+                } else {
+                    CastKind::Invalid // Source can't cast to any member
+                }
+            }
+
+            // Other cross-type casts (int/uint to float, etc.)
+            (Type::Int(..) | Type::UInt(..), Type::Float(..)) => CastKind::Dynamic,
+            (Type::Float(..), Type::Int(..) | Type::UInt(..)) => CastKind::Dynamic,
+
+            // Special types
+            (Type::Error(..), _) | (_, Type::Error(..)) => CastKind::Invalid,
+            (Type::Control, _) | (_, Type::Control) => CastKind::Invalid,
+            (Type::Memory, _) | (_, Type::Memory) => CastKind::Invalid,
+            (Type::Never, _) => CastKind::Static, // Never can cast to anything (vacuously)
+            (_, Type::Never) => CastKind::Invalid, // Nothing can cast to Never
+            (Type::Any, _) => CastKind::Dynamic,  // Any might be anything at runtime
+            (_, Type::Any) => CastKind::Static,   // Everything can upcast to Any
+
+            // Everything else is invalid
+            _ => CastKind::Invalid,
         }
     }
 }

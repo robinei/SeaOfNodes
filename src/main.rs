@@ -66,6 +66,11 @@ pub enum NodeKind {
     Sub,
     Mul,
     Div,
+
+    // cast operations
+    // inputs: control, value
+    StaticCast,  // safe cast, no runtime check needed
+    DynamicCast, // cast requiring runtime type check
 }
 
 #[derive(Copy, Clone)]
@@ -392,6 +397,36 @@ impl IRBuilder {
         node.set_inputs(&[self.current_control, self.intern(cond)]);
         node
     }
+
+    pub fn create_cast(&mut self, value: &Node, target_type: Type) -> Result<Node, IRError> {
+        use crate::types::CastKind;
+        
+        match value.t.cast_kind(&target_type) {
+            CastKind::Static => {
+                // Identity cast - just return the original node with new type
+                if value.t == target_type {
+                    Ok(value.clone())
+                } else {
+                    // Safe cast, create StaticCast node
+                    let mut node = Node::new(NodeKind::StaticCast, target_type);
+                    node.set_inputs(&[self.current_control, self.intern(value)]);
+                    Ok(node)
+                }
+            }
+            
+            CastKind::Dynamic => {
+                // Runtime check required, create DynamicCast node
+                let mut node = Node::new(NodeKind::DynamicCast, target_type);
+                node.set_inputs(&[self.current_control, self.intern(value)]);
+                Ok(node)
+            }
+            
+            CastKind::Invalid => {
+                // Cast is impossible
+                Err(IRError::TypeMismatch)
+            }
+        }
+    }
 }
 
 fn main() {
@@ -624,5 +659,62 @@ mod tests {
 
         // float + bool should error
         assert!(float_type.add(&bool_type).is_err());
+    }
+
+    #[test]
+    fn test_cast_functionality() {
+        use crate::types::CastKind;
+        use crate::constraints::{IntConstraint, UIntConstraint};
+        let mut builder = IRBuilder::new();
+
+        // Test static cast - widening with compatible range
+        let narrow_int = Type::Int(IntPrim::I8, IntConstraint::new(10, 20));
+        let wide_int = Type::Int(IntPrim::I32, IntConstraint::new(0, 100));
+        assert_eq!(narrow_int.cast_kind(&wide_int), CastKind::Static);
+
+        // Test dynamic cast - narrowing
+        let wide_range = Type::Int(IntPrim::I32, IntConstraint::new(0, 1000));
+        let narrow_range = Type::Int(IntPrim::I32, IntConstraint::new(50, 150));
+        assert_eq!(wide_range.cast_kind(&narrow_range), CastKind::Dynamic);
+
+        // Test invalid cast - disjoint ranges
+        let range_a = Type::Int(IntPrim::I32, IntConstraint::new(0, 10));
+        let range_b = Type::Int(IntPrim::I32, IntConstraint::new(50, 100));
+        assert_eq!(range_a.cast_kind(&range_b), CastKind::Invalid);
+
+        // Test cross-type cast (signed to unsigned)
+        let signed_positive = Type::Int(IntPrim::I32, IntConstraint::new(0, 100));
+        let unsigned_compatible = Type::UInt(UIntPrim::U32, UIntConstraint::new(0, 100));
+        assert_eq!(signed_positive.cast_kind(&unsigned_compatible), CastKind::Static);
+
+        let signed_negative = Type::Int(IntPrim::I32, IntConstraint::new(-50, 10));
+        let unsigned_range = Type::UInt(UIntPrim::U32, UIntConstraint::new(0, 100));
+        assert_eq!(signed_negative.cast_kind(&unsigned_range), CastKind::Dynamic);
+
+        // Test bool casts
+        let bool_true = Type::Bool(BoolConstraint::Const(true));
+        let bool_false = Type::Bool(BoolConstraint::Const(false));
+        let bool_any = Type::Bool(BoolConstraint::Any);
+
+        assert_eq!(bool_true.cast_kind(&bool_any), CastKind::Static);   // widening
+        assert_eq!(bool_any.cast_kind(&bool_true), CastKind::Dynamic);  // narrowing
+        assert_eq!(bool_true.cast_kind(&bool_false), CastKind::Invalid); // disjoint
+
+        // Test create_cast method
+        let const_5 = Node::const_int(5);
+        let target_type = Type::Int(IntPrim::I32, IntConstraint::new(0, 10));
+        
+        // This should be a static cast (5 is in range [0, 10])
+        let cast_result = builder.create_cast(&const_5, target_type.clone());
+        assert!(cast_result.is_ok());
+        let cast_node = cast_result.unwrap();
+        assert_eq!(cast_node.kind, NodeKind::StaticCast);
+        assert_eq!(cast_node.t, target_type);
+
+        // Test invalid cast
+        let target_type_invalid = Type::Int(IntPrim::I32, IntConstraint::new(10, 20));
+        let cast_result = builder.create_cast(&const_5, target_type_invalid);
+        assert!(cast_result.is_err());
+        assert_eq!(cast_result.unwrap_err(), IRError::TypeMismatch);
     }
 }
