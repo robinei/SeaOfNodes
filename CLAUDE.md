@@ -14,15 +14,12 @@ This is a Sea of Nodes compiler IR implementation in Rust with aggressive on-the
 - No hash table lookups for simple type operations
 - Direct type inspection during optimization
 
-**Error Type Normalization**: The system uses `Error(T)` for typed errors with canonical normalization:
-- `Error(Never)` → `Never`
-- `Error(Error(T))` → `Error(T)` (unwraps nested errors)
-- `Error(Union([A, B]))` → `Union([Error(A), Error(B)])` (distributes over unions)
-- `Union([Error(A), Error(B)])` → `Error(Union([A, B]))` (merges adjacent errors)
-
-This ensures only two canonical error forms exist:
-1. Pure error: `Error(T)` where T contains no Error types
-2. Mixed union: `Union([T1, Error(T2)])` where T1, T2 contain no Error types
+**Union Flattening for Runtime Efficiency**: The system flattens errors to individual union members:
+- `Error(Union([A, B]))` → `Union([Error(A), Error(B)])` (distributes immediately)
+- No nested `Error(Union(...))` structures exist
+- Errors naturally sort to the tail of unions due to derived `Ord`
+- Enables efficient runtime representation: `tag + data` with `tag >= first_error_index` for error checking
+- Simple sequential tag indexing for all union members
 
 ### Generic Constraint System
 
@@ -52,9 +49,10 @@ This ensures only two canonical error forms exist:
 
 ```
 src/
-├── main.rs          # Node definitions, IRBuilder, main compilation driver
-├── types.rs         # Type system, union normalization, error handling
+├── main.rs          # Node definitions, IRBuilder, cast functionality
+├── types.rs         # Type system, union/error flattening, product types  
 ├── constraints.rs   # Generic constraint system, arithmetic operations
+├── symbols.rs       # Thread-safe symbol interning with NonZeroU32 optimization
 └── Cargo.toml       # Dependencies: ordered-float, num-traits
 ```
 
@@ -62,16 +60,19 @@ src/
 
 ### Union Normalization (`Type::make_union`)
 1. **Flatten nested unions**: `Union([Union([A, B]), C])` → `[A, B, C]`
-2. **Sort and deduplicate**: Ensures canonical ordering
-3. **Handle special cases**: Any subsumes all, Never filtered out
-4. **Merge adjacent ranges**: `[Int(1-5), Int(4-8)]` → `Int(1-8)`
-5. **Merge adjacent errors**: `[Error(A), Error(B)]` → `Error(Union([A, B]))`
-6. **Collapse single elements**: `Union([T])` → `T`
+2. **Distribute error unions**: `Error(Union([A, B]))` → `[Error(A), Error(B)]`
+3. **Sort and deduplicate**: Ensures canonical ordering (errors naturally sort to tail)
+4. **Handle special cases**: Any subsumes all, Never filtered out
+5. **Merge adjacent ranges**: `[Int(1-5), Int(4-8)]` → `Int(1-8)`
+6. **No error merging**: Prevents nested `Error(Union(...))` structures
+7. **Collapse single elements**: `Union([T])` → `T`
 
-### Error Distribution (`Type::normalize`)
-- `Error(Union([A, B]))` gets distributed to `Union([Error(A), Error(B)])`
-- Then union merging consolidates back to `Error(Union([A, B]))`
-- This flattens nested errors: `Error(Union([A, Error(B)]))` → `Error(Union([A, B]))`
+### Product Types (`Type::Data`)
+- **Structural nominal typing**: Same tag + same fields = equal types
+- **Symbol interning**: Field names stored as `SymbolId` with `NonZeroU32` optimization
+- **Unified representation**: Both tuples and records use `DataField` array
+- **Field naming**: Tuples use "0", "1", etc.; records use actual field names
+- **Helper constructors**: `make_tuple`, `make_named_tuple`, `make_record`, `make_named_record`
 
 ## Memory and Performance Characteristics
 
@@ -98,10 +99,11 @@ Comprehensive test coverage for:
 ## Build Commands
 
 ```bash
-cargo check          # Type check
-cargo test           # Run all tests
+cargo test           # Run all tests (preferred - tests everything at once)
 cargo run            # Build and run
 ```
+
+**Note**: Only run `cargo test` (not `cargo check` or specific tests) as it's faster to test everything at once.
 
 ## Implementation Notes
 
@@ -120,5 +122,19 @@ All arithmetic operations (add, sub, mul, div) include:
 - Range propagation for optimization
 - Error handling for provable overflow vs runtime cases
 
+### Cast System
+**Three-way cast analysis** with `CastKind` enum:
+- **Static**: Guaranteed safe, no runtime check (e.g., widening with compatible ranges)
+- **Dynamic**: Requires runtime type check (e.g., narrowing or cross-type casts)  
+- **Invalid**: Definitely impossible (e.g., disjoint ranges)
+
+**Range-based analysis**: Uses `CommonRange` (i128) for unified signed/unsigned comparison
+**Cross-type support**: Signed ↔ unsigned casts based on range overlap/containment
+
+### Symbol Interning System
+**Thread-safe design** with `RwLock<SymbolTable>` and `OnceLock` for global state
+**Space optimization**: `SymbolId(NonZeroU32)` enables `Option<SymbolId>` same size as `SymbolId`  
+**Performance**: Read-preferring locks for efficient concurrent symbol lookup
+
 ### Future Extensibility
-The generic constraint system allows easy addition of new constraint types by implementing the `ConstraintValue` trait. The error normalization system supports rich error types with full type information.
+The generic constraint system allows easy addition of new constraint types by implementing the `ConstraintValue` trait. The product type system supports future syntax extensions like `data Point(x: i32, y: i32)` and anonymous structural types.
