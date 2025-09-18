@@ -4,6 +4,7 @@ use ordered_float::OrderedFloat;
 
 use crate::IRError;
 use crate::constraints::*;
+use crate::symbols::SymbolId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastKind {
@@ -33,6 +34,12 @@ enum ArithmeticOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DataField {
+    pub name: SymbolId,  // Field name (e.g. "x", "y" for records, "0", "1" for tuples)
+    pub ty: Type,        // Field type
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Any,   // top
     Never, // bottom
@@ -46,6 +53,8 @@ pub enum Type {
     Int(IntPrim, IntConstraint),
     UInt(UIntPrim, UIntConstraint),
     Float(FloatConstraint),
+
+    Data(Option<SymbolId>, Arc<[DataField]>), // tag, fields
 
     Union(Arc<[Type]>, Priv),
 
@@ -108,6 +117,10 @@ impl Type {
                 // This prevents nested Error(Union(...)) structures
                 None
             }
+            (Type::Data(..), Type::Data(..)) => {
+                // Data types merge only if they're exactly equal (handled by a == b check below)
+                None
+            }
             _ => None, // Can't merge
         }
     }
@@ -156,6 +169,10 @@ impl Type {
                     .collect();
                 Ok(Self::make_union(results?))
             }
+            (Type::Data(..), _) | (_, Type::Data(..)) => {
+                // Data types don't support arithmetic operations
+                Err(IRError::TypeMismatch)
+            }
             _ => Err(IRError::TypeMismatch),
         }
     }
@@ -172,6 +189,35 @@ impl Type {
     pub const U64: Type = Type::prim_uint(UIntPrim::U64);
     pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
+
+    // Helper constructors for Data types
+    pub fn make_tuple(types: Vec<Type>) -> Type {
+        Self::make_data(None, types.into_iter().enumerate().map(|(i, ty)| (i.to_string(), ty)))
+    }
+
+    pub fn make_named_tuple(name: &str, types: Vec<Type>) -> Type {
+        Self::make_data(Some(name), types.into_iter().enumerate().map(|(i, ty)| (i.to_string(), ty)))
+    }
+
+    pub fn make_record(fields: Vec<(&str, Type)>) -> Type {
+        Self::make_data(None, fields.into_iter().map(|(name, ty)| (name.to_string(), ty)))
+    }
+
+    pub fn make_named_record(name: &str, fields: Vec<(&str, Type)>) -> Type {
+        Self::make_data(Some(name), fields.into_iter().map(|(name, ty)| (name.to_string(), ty)))
+    }
+
+    fn make_data(tag: Option<&str>, fields: impl Iterator<Item = (String, Type)>) -> Type {
+        use crate::symbols::intern_symbol;
+        let tag_id = tag.map(|s| intern_symbol(s));
+        let data_fields: Arc<[DataField]> = fields
+            .map(|(name, ty)| DataField {
+                name: intern_symbol(&name),
+                ty,
+            })
+            .collect();
+        Type::Data(tag_id, data_fields)
+    }
 
     pub fn make_union(mut types: Vec<Type>) -> Type {
         // Flatten nested unions and distribute errors over unions
@@ -349,6 +395,15 @@ impl Type {
 
             (other, Type::Union(types, ..)) => other.intersect(&Type::make_union(types.to_vec())),
 
+            // Data types intersect only if exactly equal
+            (Type::Data(..), Type::Data(..)) => {
+                if self == other {
+                    self.clone()
+                } else {
+                    Type::Never
+                }
+            }
+
             // Exact same type → return self
             (a, b) if a == b => self.clone(),
 
@@ -435,6 +490,15 @@ impl Type {
                     .filter(|t| !matches!(t, Type::Never))
                     .collect();
                 Type::make_union(subtracted)
+            }
+
+            // Data types subtract only if exactly equal
+            (Type::Data(..), Type::Data(..)) => {
+                if self == other {
+                    Type::Never
+                } else {
+                    self.clone()
+                }
             }
 
             // Exact same type → empty result
@@ -550,6 +614,7 @@ impl Type {
             Type::Int(_, c) => c.is_const(),
             Type::UInt(_, c) => c.is_const(),
             Type::Float(c) => c.is_const(),
+            Type::Data(..) => false, // Data types are not primitive constants
             _ => false,
         }
     }
@@ -708,6 +773,16 @@ impl Type {
             (_, Type::Never) => CastKind::Invalid, // Nothing can cast to Never
             (Type::Any, _) => CastKind::Dynamic,  // Any might be anything at runtime
             (_, Type::Any) => CastKind::Static,   // Everything can upcast to Any
+
+            // Data types can only cast to themselves (static) or to unions containing them
+            (Type::Data(..), Type::Data(..)) => {
+                if self == target_type {
+                    CastKind::Static
+                } else {
+                    CastKind::Invalid
+                }
+            }
+            (Type::Data(..), _) | (_, Type::Data(..)) => CastKind::Invalid,
 
             // Everything else is invalid
             _ => CastKind::Invalid,
@@ -1033,5 +1108,72 @@ mod tests {
         // Error(A) - Error(A) → Never
         let result = error_i32.subtract(&error_i32);
         assert_eq!(result, Type::Never);
+    }
+
+    #[test]
+    fn test_data_types() {
+        use crate::symbols::{intern_symbol, symbol_name};
+
+        // Test anonymous tuple
+        let tuple_type = Type::make_tuple(vec![Type::I32, Type::Bool(BoolConstraint::Any)]);
+        if let Type::Data(tag, fields) = tuple_type {
+            assert_eq!(tag, None); // Anonymous
+            assert_eq!(fields.len(), 2);
+            assert_eq!(symbol_name(fields[0].name).unwrap(), "0");
+            assert_eq!(symbol_name(fields[1].name).unwrap(), "1");
+            assert_eq!(fields[0].ty, Type::I32);
+            assert_eq!(fields[1].ty, Type::Bool(BoolConstraint::Any));
+        } else {
+            panic!("Expected Data type");
+        }
+
+        // Test named tuple
+        let point_type = Type::make_named_tuple("Point", vec![Type::I32, Type::I32]);
+        if let Type::Data(tag, fields) = point_type {
+            assert_eq!(tag, Some(intern_symbol("Point")));
+            assert_eq!(fields.len(), 2);
+            assert_eq!(symbol_name(fields[0].name).unwrap(), "0");
+            assert_eq!(symbol_name(fields[1].name).unwrap(), "1");
+        } else {
+            panic!("Expected Data type");
+        }
+
+        // Test anonymous record
+        let record_type = Type::make_record(vec![
+            ("x", Type::I32),
+            ("y", Type::I32),
+        ]);
+        if let Type::Data(tag, fields) = record_type {
+            assert_eq!(tag, None); // Anonymous
+            assert_eq!(fields.len(), 2);
+            assert_eq!(symbol_name(fields[0].name).unwrap(), "x");
+            assert_eq!(symbol_name(fields[1].name).unwrap(), "y");
+        } else {
+            panic!("Expected Data type");
+        }
+
+        // Test named record
+        let user_type = Type::make_named_record("User", vec![
+            ("name", Type::I32), // Using I32 for simplicity in tests
+            ("age", Type::I32),
+        ]);
+        if let Type::Data(tag, fields) = user_type {
+            assert_eq!(tag, Some(intern_symbol("User")));
+            assert_eq!(fields.len(), 2);
+            assert_eq!(symbol_name(fields[0].name).unwrap(), "name");
+            assert_eq!(symbol_name(fields[1].name).unwrap(), "age");
+        } else {
+            panic!("Expected Data type");
+        }
+
+        // Test structural equality - same fields, same tag should be equal
+        let point1 = Type::make_named_tuple("Point", vec![Type::I32, Type::I32]);
+        let point2 = Type::make_named_tuple("Point", vec![Type::I32, Type::I32]);
+        assert_eq!(point1, point2);
+
+        // Test structural inequality - different tags
+        let point = Type::make_named_tuple("Point", vec![Type::I32, Type::I32]);
+        let vector = Type::make_named_tuple("Vector", vec![Type::I32, Type::I32]);
+        assert_ne!(point, vector);
     }
 }
