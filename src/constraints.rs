@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::IRError;
 use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
 use ordered_float::OrderedFloat;

@@ -388,14 +388,70 @@ impl Type {
                 }
             }
 
-            // Union intersections
-            (Type::Union(types, ..), other) => {
-                let intersected: Vec<Type> = types
-                    .iter()
-                    .map(|t| t.intersect(other))
-                    .filter(|t| !matches!(t, Type::Never))
-                    .collect();
-                Type::make_union(intersected)
+            // Data type intersections - handle struct coercion
+            (Type::Data(tag1, fields1), Type::Data(tag2, fields2)) => {
+                if fields1 == fields2 {
+                    match (tag1, tag2) {
+                        // Identical untagged structs
+                        (None, None) => self.clone(),
+                        // Identical tagged structs
+                        (Some(a), Some(b)) if a == b => self.clone(),
+                        // Auto-coercion cases
+                        (None, Some(_)) => other.clone(), // untagged -> tagged
+                        (Some(_), None) => other.clone(), // tagged -> untagged
+                        // Different tags with same fields -> incompatible
+                        (Some(_), Some(_)) => Type::Never,
+                    }
+                } else {
+                    Type::Never // Different fields
+                }
+            }
+
+            // Union intersections - delegate to the specialized logic
+            (Type::Union(..), other) => other.intersect(self),
+
+            // Union intersection with ambiguity handling
+            (source, Type::Union(types, ..)) => {
+                // First check for exact match - this has highest priority
+                if types.iter().any(|t| source == t) {
+                    return source.clone(); // Exact match wins
+                }
+
+                let mut tagged_match = None;
+                let mut untagged_match = None;
+                let mut other_match = None;
+                let mut tagged_count = 0;
+                let mut untagged_count = 0;
+                let mut other_count = 0;
+
+                for t in types.iter() {
+                    let intersection = source.intersect(t);
+                    if !matches!(intersection, Type::Never) {
+                        match intersection {
+                            Type::Data(Some(_), _) => {
+                                tagged_count += 1;
+                                tagged_match = Some(intersection);
+                            }
+                            Type::Data(None, _) => {
+                                untagged_count += 1;
+                                untagged_match = Some(intersection);
+                            }
+                            other => {
+                                other_count += 1;
+                                other_match = Some(other);
+                            }
+                        }
+                    }
+                }
+
+                match (tagged_count, untagged_count, other_count) {
+                    (0, 0, 0) => Type::Never,             // No matches
+                    (1, 0, 0) => tagged_match.unwrap(),   // Single tagged
+                    (0, 1, 0) => untagged_match.unwrap(), // Single untagged
+                    (0, 0, 1) => other_match.unwrap(),    // Single other
+                    (1, _, 0) => tagged_match.unwrap(),   // Prefer tagged over untagged
+                    (_, _, _) => Type::Never,             // Any ambiguity = error
+                }
             }
 
             // Error intersections
@@ -406,8 +462,6 @@ impl Type {
                     other => Type::make_error(other),
                 }
             }
-
-            (other, Type::Union(types, ..)) => other.intersect(&Type::make_union(types.to_vec())),
 
             // Different types → no intersection
             _ => Type::Never,
@@ -770,17 +824,15 @@ impl Type {
                 }
             }
 
-            // Cast to union - static if source is a member
-            (source, Type::Union(types, ..)) => {
-                if types.iter().any(|t| source == t) {
-                    CastKind::Static // Source is already a union member
-                } else if types
-                    .iter()
-                    .any(|t| source.cast_kind(t) != CastKind::Invalid)
-                {
-                    CastKind::Dynamic // Source can cast to at least one member
+            // Cast to union - use lattice algebra
+            (source, Type::Union(..)) => {
+                let intersection = source.intersect(target_type);
+                if intersection == Type::Never {
+                    CastKind::Invalid // No compatible types
+                } else if intersection == *source {
+                    CastKind::Static // Source is subset of union
                 } else {
-                    CastKind::Invalid // Source can't cast to any member
+                    CastKind::Dynamic // Partial compatibility
                 }
             }
 
@@ -793,12 +845,13 @@ impl Type {
             (Type::Any, _) => CastKind::Dynamic,  // Any might be anything at runtime
             (_, Type::Any) => CastKind::Static,   // Everything can upcast to Any
 
-            // Data types can only cast to themselves (static) or to unions containing them
+            // Data types - use intersection to check coercion compatibility
             (Type::Data(..), Type::Data(..)) => {
-                if self == target_type {
-                    CastKind::Static
+                let intersection = self.intersect(target_type);
+                if intersection == *target_type {
+                    CastKind::Static // Successful coercion
                 } else {
-                    CastKind::Invalid
+                    CastKind::Invalid // No coercion possible
                 }
             }
             (Type::Data(..), _) | (_, Type::Data(..)) => CastKind::Invalid,
@@ -839,7 +892,7 @@ impl TypeConstraint {
                 CompareOp::Eq => a == b,
                 CompareOp::Neq => a != b,
             }),
-            _ => None, // Conservative for non-constant floats
+            _ => None, // Conservative for non-constant types
         }
     }
 }
@@ -1229,5 +1282,142 @@ mod tests {
         let point = Type::make_named_tuple("Point", vec![Type::I32, Type::I32]);
         let vector = Type::make_named_tuple("Vector", vec![Type::I32, Type::I32]);
         assert_ne!(point, vector);
+    }
+
+    #[test]
+    fn test_struct_coercion_intersect() {
+        use crate::symbols::intern_symbol;
+
+        // Create test fields
+        let fields: Arc<[DataField]> = vec![
+            DataField {
+                name: intern_symbol("x"),
+                ty: Type::I32,
+            },
+            DataField {
+                name: intern_symbol("y"),
+                ty: Type::I32,
+            },
+        ]
+        .into();
+
+        let untagged = Type::Data(None, fields.clone());
+        let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
+        let tagged_vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
+
+        // Untagged -> Tagged coercion
+        let intersection = untagged.intersect(&tagged_point);
+        assert_eq!(intersection, tagged_point);
+
+        // Tagged -> Untagged coercion
+        let intersection = tagged_point.intersect(&untagged);
+        assert_eq!(intersection, untagged);
+
+        // Different tags with same fields -> incompatible
+        let intersection = tagged_point.intersect(&tagged_vector);
+        assert_eq!(intersection, Type::Never);
+
+        // Different fields -> incompatible
+        let different_fields: Arc<[DataField]> = vec![DataField {
+            name: intern_symbol("a"),
+            ty: Type::I32,
+        }]
+        .into();
+        let different_struct = Type::Data(None, different_fields);
+        let intersection = untagged.intersect(&different_struct);
+        assert_eq!(intersection, Type::Never);
+    }
+
+    #[test]
+    fn test_struct_coercion_cast_kind() {
+        use crate::symbols::intern_symbol;
+
+        let fields: Arc<[DataField]> = vec![
+            DataField {
+                name: intern_symbol("x"),
+                ty: Type::I32,
+            },
+            DataField {
+                name: intern_symbol("y"),
+                ty: Type::I32,
+            },
+        ]
+        .into();
+
+        let untagged = Type::Data(None, fields.clone());
+        let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
+
+        // Untagged can cast to tagged (static)
+        assert_eq!(untagged.cast_kind(&tagged_point), CastKind::Static);
+
+        // Tagged can cast to untagged (static)
+        assert_eq!(tagged_point.cast_kind(&untagged), CastKind::Static);
+
+        // Different tags cannot cast
+        let tagged_vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
+        assert_eq!(tagged_point.cast_kind(&tagged_vector), CastKind::Invalid);
+    }
+
+    #[test]
+    fn test_union_coercion_ambiguity() {
+        use crate::symbols::intern_symbol;
+
+        let fields: Arc<[DataField]> = vec![
+            DataField {
+                name: intern_symbol("x"),
+                ty: Type::I32,
+            },
+            DataField {
+                name: intern_symbol("y"),
+                ty: Type::I32,
+            },
+        ]
+        .into();
+
+        let untagged = Type::Data(None, fields.clone());
+        let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
+        let tagged_vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
+
+        // Single match - should succeed
+        let union_single = Type::make_union(vec![tagged_point.clone(), Type::I32]);
+        let intersection = untagged.intersect(&union_single);
+        assert_eq!(intersection, tagged_point);
+
+        // Multiple tagged matches - should fail (ambiguous)
+        let union_ambiguous = Type::make_union(vec![tagged_point.clone(), tagged_vector.clone()]);
+        let intersection = untagged.intersect(&union_ambiguous);
+        assert_eq!(intersection, Type::Never);
+
+        // Tagged + untagged - should return exact match (untagged)
+        let union_mixed = Type::make_union(vec![tagged_point.clone(), untagged.clone()]);
+        let intersection = untagged.intersect(&union_mixed);
+        assert_eq!(intersection, untagged); // Exact match wins over specificity
+    }
+
+    #[test]
+    fn test_union_intersection_commutativity() {
+        use crate::symbols::intern_symbol;
+
+        let fields: Arc<[DataField]> = vec![
+            DataField {
+                name: intern_symbol("x"),
+                ty: Type::I32,
+            },
+            DataField {
+                name: intern_symbol("y"),
+                ty: Type::I32,
+            },
+        ]
+        .into();
+
+        let untagged = Type::Data(None, fields.clone());
+        let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
+        let union = Type::make_union(vec![tagged_point.clone(), Type::I32]);
+
+        // Test commutativity: a ∩ b = b ∩ a
+        let intersection1 = untagged.intersect(&union);
+        let intersection2 = union.intersect(&untagged);
+        assert_eq!(intersection1, intersection2);
+        assert_eq!(intersection1, tagged_point);
     }
 }
