@@ -298,7 +298,7 @@ impl IRBuilder {
             self.create_add(&xy, &z)?
         } else {
             let mut node = Node::new(NodeKind::Add, t);
-            node.set_inputs(&[self.intern(lhs), self.intern(rhs)]);
+            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]);
             node
         })
     }
@@ -356,7 +356,7 @@ impl IRBuilder {
         } else if l == r {
             // x * x => x^2 (no special peephole for now)
             let mut node = Node::new(NodeKind::Mul, t);
-            node.set_inputs(&[self.intern(lhs), self.intern(rhs)]);
+            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]);
             node
         } else if l.kind != NodeKind::Mul && r.kind == NodeKind::Mul {
             // non-mul * mul => mul * non-mul (canonicalize)
@@ -401,7 +401,7 @@ impl IRBuilder {
 
     pub fn create_cast(&mut self, value: &Node, target_type: Type) -> Result<Node, IRError> {
         use crate::types::CastKind;
-        
+
         match value.t.cast_kind(&target_type) {
             CastKind::Static => {
                 // Identity cast - just return the original node with new type
@@ -410,18 +410,18 @@ impl IRBuilder {
                 } else {
                     // Safe cast, create StaticCast node
                     let mut node = Node::new(NodeKind::StaticCast, target_type);
-                    node.set_inputs(&[self.current_control, self.intern(value)]);
+                    node.set_inputs(&[0, self.intern(value)]);
                     Ok(node)
                 }
             }
-            
+
             CastKind::Dynamic => {
                 // Runtime check required, create DynamicCast node
                 let mut node = Node::new(NodeKind::DynamicCast, target_type);
-                node.set_inputs(&[self.current_control, self.intern(value)]);
+                node.set_inputs(&[0, self.intern(value)]);
                 Ok(node)
             }
-            
+
             CastKind::Invalid => {
                 // Cast is impossible
                 Err(IRError::TypeMismatch)
@@ -664,8 +664,8 @@ mod tests {
 
     #[test]
     fn test_cast_functionality() {
-        use crate::types::CastKind;
         use crate::constraints::{IntConstraint, UIntConstraint};
+        use crate::types::CastKind;
         let mut builder = IRBuilder::new();
 
         // Test static cast - widening with compatible range
@@ -686,25 +686,31 @@ mod tests {
         // Test cross-type cast (signed to unsigned)
         let signed_positive = Type::Int(IntPrim::I32, IntConstraint::new(0, 100));
         let unsigned_compatible = Type::UInt(UIntPrim::U32, UIntConstraint::new(0, 100));
-        assert_eq!(signed_positive.cast_kind(&unsigned_compatible), CastKind::Static);
+        assert_eq!(
+            signed_positive.cast_kind(&unsigned_compatible),
+            CastKind::Static
+        );
 
         let signed_negative = Type::Int(IntPrim::I32, IntConstraint::new(-50, 10));
         let unsigned_range = Type::UInt(UIntPrim::U32, UIntConstraint::new(0, 100));
-        assert_eq!(signed_negative.cast_kind(&unsigned_range), CastKind::Dynamic);
+        assert_eq!(
+            signed_negative.cast_kind(&unsigned_range),
+            CastKind::Dynamic
+        );
 
         // Test bool casts
         let bool_true = Type::Bool(BoolConstraint::Const(true));
         let bool_false = Type::Bool(BoolConstraint::Const(false));
         let bool_any = Type::Bool(BoolConstraint::Any);
 
-        assert_eq!(bool_true.cast_kind(&bool_any), CastKind::Static);   // widening
-        assert_eq!(bool_any.cast_kind(&bool_true), CastKind::Dynamic);  // narrowing
+        assert_eq!(bool_true.cast_kind(&bool_any), CastKind::Static); // widening
+        assert_eq!(bool_any.cast_kind(&bool_true), CastKind::Dynamic); // narrowing
         assert_eq!(bool_true.cast_kind(&bool_false), CastKind::Invalid); // disjoint
 
         // Test create_cast method
         let const_5 = Node::const_int(5);
         let target_type = Type::Int(IntPrim::I32, IntConstraint::new(0, 10));
-        
+
         // This should be a static cast (5 is in range [0, 10])
         let cast_result = builder.create_cast(&const_5, target_type.clone());
         assert!(cast_result.is_ok());
@@ -722,30 +728,30 @@ mod tests {
     #[test]
     fn test_union_error_flattening() {
         use crate::types::*;
-        
+
         // Create two basic types
         let int_type = Type::I32;
         let bool_type = Type::BOOL;
-        
+
         // Create a union of these types
         let union_type = Type::make_union(vec![int_type.clone(), bool_type.clone()]);
-        
+
         // Create an Error wrapping this union - this should get flattened
         let error_union = Type::make_error(union_type);
-        
+
         // Create another union that includes this Error(Union(...))
         let outer_union = Type::make_union(vec![Type::Unit, error_union]);
-        
-        // Verify the result: should be Union([Unit, Error(I32), Error(Bool)]) 
+
+        // Verify the result: should be Union([Unit, Error(I32), Error(Bool)])
         // with errors at the tail
         if let Type::Union(types, ..) = outer_union {
             assert_eq!(types.len(), 3);
             assert_eq!(types[0], Type::Unit);
-            
+
             // The errors should be at the tail
             assert!(matches!(types[1], Type::Error(..)));
             assert!(matches!(types[2], Type::Error(..)));
-            
+
             // Extract inner types from errors to verify they are I32 and Bool
             if let (Type::Error(inner1, ..), Type::Error(inner2, ..)) = (&types[1], &types[2]) {
                 let inner_types = vec![(&**inner1).clone(), (&**inner2).clone()];

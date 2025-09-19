@@ -39,6 +39,45 @@ pub struct DataField {
     pub ty: Type,       // Field type
 }
 
+#[derive(Debug, Clone)]
+pub struct FunParam {
+    pub name: SymbolId, // Parameter name for documentation/errors
+    pub ty: Type,       // Parameter type
+}
+
+// Custom implementations that ignore name for structural type equality
+impl PartialEq for FunParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+    }
+}
+
+impl Eq for FunParam {}
+
+impl std::hash::Hash for FunParam {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ty.hash(state);
+    }
+}
+
+impl PartialOrd for FunParam {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FunParam {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ty.cmp(&other.ty)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FunInfo {
+    pub return_type: Type,
+    pub params: Vec<FunParam>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Any,   // top
@@ -54,6 +93,8 @@ pub enum Type {
     UInt(UIntPrim, UIntConstraint),
     Float(FloatConstraint),
     Type(TypeConstraint),
+
+    Fun(Arc<FunInfo>),
 
     Data(Option<SymbolId>, Arc<[DataField]>), // tag, fields
 
@@ -1392,6 +1433,36 @@ mod tests {
         let union_mixed = Type::make_union(vec![tagged_point.clone(), untagged.clone()]);
         let intersection = untagged.intersect(&union_mixed);
         assert_eq!(intersection, untagged); // Exact match wins over specificity
+    }
+
+    #[test]
+    fn test_function_parameter_structural_equality() {
+        use crate::symbols::intern_symbol;
+
+        // Same type, different names should be equal
+        let param1 = FunParam {
+            name: intern_symbol("width"),
+            ty: Type::I32,
+        };
+        let param2 = FunParam {
+            name: intern_symbol("height"),
+            ty: Type::I32,
+        };
+
+        assert_eq!(param1, param2); // Structural equality ignores names
+
+        // Same hash too
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(param1.clone(), "first");
+        assert_eq!(map.get(&param2), Some(&"first")); // Same hash bucket
+
+        // Different types should not be equal
+        let param3 = FunParam {
+            name: intern_symbol("width"),
+            ty: Type::F32,
+        };
+        assert_ne!(param1, param3);
     }
 
     #[test]
