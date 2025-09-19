@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
+use crate::IRError;
 use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
 use ordered_float::OrderedFloat;
-use crate::IRError;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -78,7 +80,17 @@ pub enum CompareOp {
 }
 
 pub trait ConstraintValue:
-    Copy + Clone + PartialOrd + Ord + CheckedAdd + CheckedSub + CheckedMul + CheckedDiv + Zero + One + std::fmt::Debug
+    Copy
+    + Clone
+    + PartialOrd
+    + Ord
+    + CheckedAdd
+    + CheckedSub
+    + CheckedMul
+    + CheckedDiv
+    + Zero
+    + One
+    + std::fmt::Debug
 {
     type Primitive: Copy + Clone + PartialEq + Eq + std::fmt::Debug;
 
@@ -165,7 +177,6 @@ impl<T: ConstraintValue> RangeConstraint<T> {
             _ => return Err(IRError::InvalidPrimitiveCoercion),
         };
 
-
         // Apply operation to get min/max bounds
         let constraint = match op(self, other) {
             Some((min, max)) => {
@@ -201,14 +212,26 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         if let [Some(r0), Some(r1), Some(r2), Some(r3)] = results {
             let mut min = r0;
             let mut max = r0;
-            
-            if r1 < min { min = r1; }
-            if r1 > max { max = r1; }
-            if r2 < min { min = r2; }
-            if r2 > max { max = r2; }
-            if r3 < min { min = r3; }
-            if r3 > max { max = r3; }
-            
+
+            if r1 < min {
+                min = r1;
+            }
+            if r1 > max {
+                max = r1;
+            }
+            if r2 < min {
+                min = r2;
+            }
+            if r2 > max {
+                max = r2;
+            }
+            if r3 < min {
+                min = r3;
+            }
+            if r3 > max {
+                max = r3;
+            }
+
             Some((min, max))
         } else {
             None
@@ -473,17 +496,17 @@ impl CommonRange {
     pub fn new(min: i128, max: i128) -> Self {
         Self { min, max }
     }
-    
+
     /// Check if self completely contains other
     pub fn contains(&self, other: &Self) -> bool {
         self.min <= other.min && self.max >= other.max
     }
-    
+
     /// Check if self overlaps with other
     pub fn overlaps(&self, other: &Self) -> bool {
         self.max >= other.min && self.min <= other.max
     }
-    
+
     /// Check if self is disjoint from other
     pub fn is_disjoint(&self, other: &Self) -> bool {
         !self.overlaps(other)

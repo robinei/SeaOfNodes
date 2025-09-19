@@ -35,8 +35,8 @@ enum ArithmeticOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DataField {
-    pub name: SymbolId,  // Field name (e.g. "x", "y" for records, "0", "1" for tuples)
-    pub ty: Type,        // Field type
+    pub name: SymbolId, // Field name (e.g. "x", "y" for records, "0", "1" for tuples)
+    pub ty: Type,       // Field type
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -53,6 +53,7 @@ pub enum Type {
     Int(IntPrim, IntConstraint),
     UInt(UIntPrim, UIntConstraint),
     Float(FloatConstraint),
+    Type(TypeConstraint),
 
     Data(Option<SymbolId>, Arc<[DataField]>), // tag, fields
 
@@ -62,68 +63,18 @@ pub enum Type {
 }
 
 impl Type {
-    /// Try to merge two types in a union. Returns Some(merged) if possible, None if not.
-    fn try_merge_types(left: &Type, right: &Type) -> Option<Type> {
-        match (left, right) {
-            (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
-                // Adjacent or overlapping: [a,b] and [c,d] merge if b+1 >= c
-                if lc.max.saturating_add(1) >= rc.min {
-                    Some(Type::Int(
-                        *lp,
-                        IntConstraint::new(lc.min, lc.max.max(rc.max)),
-                    ))
-                } else {
-                    None
-                }
-            }
-            (Type::UInt(lp, lc), Type::UInt(rp, rc)) if lp == rp => {
-                // Adjacent or overlapping with overflow protection
-                if lc.max.saturating_add(1) >= rc.min {
-                    Some(Type::UInt(
-                        *lp,
-                        UIntConstraint::new(lc.min, lc.max.max(rc.max)),
-                    ))
-                } else {
-                    None
-                }
-            }
-            (Type::Bool(lc), Type::Bool(rc)) => {
-                // Any Bool constraint subsumes more specific ones
-                match (lc, rc) {
-                    (BoolConstraint::Any, _) | (_, BoolConstraint::Any) => {
-                        Some(Type::Bool(BoolConstraint::Any))
-                    }
-                    (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => {
-                        Some(Type::Bool(*lc))
-                    }
-                    (BoolConstraint::Const(_), BoolConstraint::Const(_)) => {
-                        Some(Type::Bool(BoolConstraint::Any))
-                    } // true ∪ false = Any
-                }
-            }
-            (Type::Float(FloatConstraint::Any(prim)), Type::Float(FloatConstraint::Const(_)))
-            | (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(prim))) => {
-                // Polymorphic constant gets subsumed by specific primitive
-                Some(Type::Float(FloatConstraint::Any(*prim)))
-            }
-            (Type::Float(FloatConstraint::Const(a)), Type::Float(FloatConstraint::Const(b)))
-                if a == b =>
-            {
-                // Identical constants merge
-                Some(Type::Float(FloatConstraint::Const(*a)))
-            }
-            (Type::Error(..), Type::Error(..)) => {
-                // Don't merge errors here - let make_union handle flattening
-                // This prevents nested Error(Union(...)) structures
-                None
-            }
-            (Type::Data(..), Type::Data(..)) => {
-                // Data types merge only if they're exactly equal (handled by a == b check below)
-                None
-            }
-            _ => None, // Can't merge
-        }
-    }
+    pub const UNIT: Type = Type::Unit;
+    pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
+    pub const I8: Type = Type::prim_int(IntPrim::I8);
+    pub const I16: Type = Type::prim_int(IntPrim::I16);
+    pub const I32: Type = Type::prim_int(IntPrim::I32);
+    pub const I64: Type = Type::prim_int(IntPrim::I64);
+    pub const U8: Type = Type::prim_uint(UIntPrim::U8);
+    pub const U16: Type = Type::prim_uint(UIntPrim::U16);
+    pub const U32: Type = Type::prim_uint(UIntPrim::U32);
+    pub const U64: Type = Type::prim_uint(UIntPrim::U64);
+    pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
+    pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
 
     /// Generic helper for binary arithmetic operations
     fn apply_arithmetic_op(&self, other: &Self, op: ArithmeticOp) -> Result<Self, IRError> {
@@ -169,42 +120,43 @@ impl Type {
                     .collect();
                 Ok(Self::make_union(results?))
             }
-            (Type::Data(..), _) | (_, Type::Data(..)) => {
-                // Data types don't support arithmetic operations
-                Err(IRError::TypeMismatch)
-            }
             _ => Err(IRError::TypeMismatch),
         }
     }
 
-    pub const UNIT: Type = Type::Unit;
-    pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
-    pub const I8: Type = Type::prim_int(IntPrim::I8);
-    pub const I16: Type = Type::prim_int(IntPrim::I16);
-    pub const I32: Type = Type::prim_int(IntPrim::I32);
-    pub const I64: Type = Type::prim_int(IntPrim::I64);
-    pub const U8: Type = Type::prim_uint(UIntPrim::U8);
-    pub const U16: Type = Type::prim_uint(UIntPrim::U16);
-    pub const U32: Type = Type::prim_uint(UIntPrim::U32);
-    pub const U64: Type = Type::prim_uint(UIntPrim::U64);
-    pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
-    pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
-
     // Helper constructors for Data types
     pub fn make_tuple(types: Vec<Type>) -> Type {
-        Self::make_data(None, types.into_iter().enumerate().map(|(i, ty)| (i.to_string(), ty)))
+        Self::make_data(
+            None,
+            types
+                .into_iter()
+                .enumerate()
+                .map(|(i, ty)| (i.to_string(), ty)),
+        )
     }
 
     pub fn make_named_tuple(name: &str, types: Vec<Type>) -> Type {
-        Self::make_data(Some(name), types.into_iter().enumerate().map(|(i, ty)| (i.to_string(), ty)))
+        Self::make_data(
+            Some(name),
+            types
+                .into_iter()
+                .enumerate()
+                .map(|(i, ty)| (i.to_string(), ty)),
+        )
     }
 
     pub fn make_record(fields: Vec<(&str, Type)>) -> Type {
-        Self::make_data(None, fields.into_iter().map(|(name, ty)| (name.to_string(), ty)))
+        Self::make_data(
+            None,
+            fields.into_iter().map(|(name, ty)| (name.to_string(), ty)),
+        )
     }
 
     pub fn make_named_record(name: &str, fields: Vec<(&str, Type)>) -> Type {
-        Self::make_data(Some(name), fields.into_iter().map(|(name, ty)| (name.to_string(), ty)))
+        Self::make_data(
+            Some(name),
+            fields.into_iter().map(|(name, ty)| (name.to_string(), ty)),
+        )
     }
 
     fn make_data(tag: Option<&str>, fields: impl Iterator<Item = (String, Type)>) -> Type {
@@ -308,6 +260,67 @@ impl Type {
         }
     }
 
+    /// Try to merge two types in a union. Returns Some(merged) if possible, None if not.
+    fn try_merge_types(left: &Type, right: &Type) -> Option<Type> {
+        if left == right {
+            // trivial merge of identical types
+            return Some(left.clone());
+        }
+
+        match (left, right) {
+            (Type::Bool(lc), Type::Bool(rc)) => {
+                // Any Bool constraint subsumes more specific ones
+                match (lc, rc) {
+                    (BoolConstraint::Any, _) | (_, BoolConstraint::Any) => {
+                        Some(Type::Bool(BoolConstraint::Any))
+                    }
+                    (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => {
+                        Some(Type::Bool(*lc))
+                    }
+                    (BoolConstraint::Const(_), BoolConstraint::Const(_)) => {
+                        Some(Type::Bool(BoolConstraint::Any))
+                    } // true ∪ false = Any
+                }
+            }
+
+            (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
+                // Adjacent or overlapping: [a,b] and [c,d] merge if b+1 >= c
+                if lc.max.saturating_add(1) >= rc.min {
+                    Some(Type::Int(
+                        *lp,
+                        IntConstraint::new(lc.min, lc.max.max(rc.max)),
+                    ))
+                } else {
+                    None
+                }
+            }
+
+            (Type::UInt(lp, lc), Type::UInt(rp, rc)) if lp == rp => {
+                // Adjacent or overlapping with overflow protection
+                if lc.max.saturating_add(1) >= rc.min {
+                    Some(Type::UInt(
+                        *lp,
+                        UIntConstraint::new(lc.min, lc.max.max(rc.max)),
+                    ))
+                } else {
+                    None
+                }
+            }
+
+            (Type::Float(FloatConstraint::Any(prim)), Type::Float(FloatConstraint::Const(_)))
+            | (Type::Float(FloatConstraint::Const(_)), Type::Float(FloatConstraint::Any(prim))) => {
+                // Polymorphic constant gets subsumed by specific primitive
+                Some(Type::Float(FloatConstraint::Any(*prim)))
+            }
+
+            (Type::Type(TypeConstraint::Any), Type::Type(TypeConstraint::Const(_)))
+            | (Type::Type(TypeConstraint::Const(_)), Type::Type(TypeConstraint::Any)) => {
+                Some(Type::Type(TypeConstraint::Any))
+            }
+            _ => None, // Can't merge
+        }
+    }
+
     pub fn make_error(inner: Type) -> Type {
         match inner {
             Type::Never => Type::Never,
@@ -341,7 +354,19 @@ impl Type {
     }
 
     pub fn intersect(&self, other: &Self) -> Type {
+        if self == other {
+            return self.clone();
+        }
+
         match (self, other) {
+            (Type::Bool(lc), Type::Bool(rc)) => match (lc, rc) {
+                (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => self.clone(),
+                (BoolConstraint::Const(_), BoolConstraint::Const(_)) => Type::Never,
+                (BoolConstraint::Const(_), BoolConstraint::Any) => self.clone(),
+                (BoolConstraint::Any, BoolConstraint::Const(_)) => other.clone(),
+                (BoolConstraint::Any, BoolConstraint::Any) => self.clone(),
+            },
+
             // Same type → intersection is the narrower constraint
             (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
                 let min = lc.min.max(rc.min);
@@ -363,26 +388,6 @@ impl Type {
                 }
             }
 
-            (Type::Bool(lc), Type::Bool(rc)) => match (lc, rc) {
-                (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => self.clone(),
-                (BoolConstraint::Const(_), BoolConstraint::Const(_)) => Type::Never,
-                (BoolConstraint::Const(_), BoolConstraint::Any) => self.clone(),
-                (BoolConstraint::Any, BoolConstraint::Const(_)) => other.clone(),
-                (BoolConstraint::Any, BoolConstraint::Any) => self.clone(),
-            },
-
-            // Error intersections
-            (Type::Error(la, ..), Type::Error(ra, ..)) => {
-                let inner_intersection = (**la).clone().intersect(&(**ra));
-                match inner_intersection {
-                    Type::Never => Type::Never,
-                    other => Type::make_error(other),
-                }
-            }
-
-            (Type::Error(..), _) => Type::Never, // Error ∩ non-error = Never
-            (_, Type::Error(..)) => Type::Never, // non-error ∩ Error = Never
-
             // Union intersections
             (Type::Union(types, ..), other) => {
                 let intersected: Vec<Type> = types
@@ -393,19 +398,16 @@ impl Type {
                 Type::make_union(intersected)
             }
 
-            (other, Type::Union(types, ..)) => other.intersect(&Type::make_union(types.to_vec())),
-
-            // Data types intersect only if exactly equal
-            (Type::Data(..), Type::Data(..)) => {
-                if self == other {
-                    self.clone()
-                } else {
-                    Type::Never
+            // Error intersections
+            (Type::Error(la, ..), Type::Error(ra, ..)) => {
+                let inner_intersection = (**la).clone().intersect(&(**ra));
+                match inner_intersection {
+                    Type::Never => Type::Never,
+                    other => Type::make_error(other),
                 }
             }
 
-            // Exact same type → return self
-            (a, b) if a == b => self.clone(),
+            (other, Type::Union(types, ..)) => other.intersect(&Type::make_union(types.to_vec())),
 
             // Different types → no intersection
             _ => Type::Never,
@@ -413,7 +415,21 @@ impl Type {
     }
 
     pub fn subtract(&self, other: &Self) -> Type {
+        if self == other {
+            return Type::Never;
+        }
+
         match (self, other) {
+            (Type::Bool(lc), Type::Bool(rc)) => {
+                match (lc, rc) {
+                    (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => Type::Never,
+                    (BoolConstraint::Const(_), BoolConstraint::Const(_)) => self.clone(), // Different constants
+                    (BoolConstraint::Any, BoolConstraint::Const(b)) => Type::const_bool(!b),
+                    (BoolConstraint::Const(_), BoolConstraint::Any) => Type::Never,
+                    (BoolConstraint::Any, BoolConstraint::Any) => Type::Never,
+                }
+            }
+
             // Same range type → compute set difference
             (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
                 // [a,b] - [c,d] can result in [a,c-1] ∪ [d+1,b]
@@ -460,16 +476,6 @@ impl Type {
                 Type::make_union(ranges)
             }
 
-            (Type::Bool(lc), Type::Bool(rc)) => {
-                match (lc, rc) {
-                    (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => Type::Never,
-                    (BoolConstraint::Const(_), BoolConstraint::Const(_)) => self.clone(), // Different constants
-                    (BoolConstraint::Any, BoolConstraint::Const(b)) => Type::const_bool(!b),
-                    (BoolConstraint::Const(_), BoolConstraint::Any) => Type::Never,
-                    (BoolConstraint::Any, BoolConstraint::Any) => Type::Never,
-                }
-            }
-
             // Error subtraction
             (Type::Error(la, ..), Type::Error(ra, ..)) => {
                 let inner_subtraction = (**la).clone().subtract(&(**ra));
@@ -478,9 +484,6 @@ impl Type {
                     other => Type::make_error(other),
                 }
             }
-
-            (Type::Error(..), _) => self.clone(), // Error - non-error = Error (unchanged)
-            (_, Type::Error(..)) => self.clone(), // non-error - Error = non-error (unchanged)
 
             // Union subtraction
             (Type::Union(types, ..), other) => {
@@ -491,18 +494,6 @@ impl Type {
                     .collect();
                 Type::make_union(subtracted)
             }
-
-            // Data types subtract only if exactly equal
-            (Type::Data(..), Type::Data(..)) => {
-                if self == other {
-                    Type::Never
-                } else {
-                    self.clone()
-                }
-            }
-
-            // Exact same type → empty result
-            (a, b) if a == b => Type::Never,
 
             // Different types → self unchanged
             _ => self.clone(),
@@ -520,6 +511,7 @@ impl Type {
     #[inline]
     fn compare(&self, other: &Self, op: CompareOp) -> Result<Type, IRError> {
         match (self, other) {
+            (Type::Bool(lc), Type::Bool(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
             (Type::Int(lp, lc), Type::Int(rp, rc)) if lp == rp => {
                 Ok(Type::bool_from_option(lc.compare(*rc, op)))
             }
@@ -527,7 +519,7 @@ impl Type {
                 Ok(Type::bool_from_option(lc.compare(*rc, op)))
             }
             (Type::Float(lc), Type::Float(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
-            (Type::Bool(lc), Type::Bool(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
+            (Type::Type(lc), Type::Type(rc)) => Ok(Type::bool_from_option(lc.compare(rc, op))),
             (Type::Union(types, ..), other) => {
                 let results: Result<Vec<_>, _> =
                     types.iter().map(|t| t.compare(other, op)).collect();
@@ -614,6 +606,7 @@ impl Type {
             Type::Int(_, c) => c.is_const(),
             Type::UInt(_, c) => c.is_const(),
             Type::Float(c) => c.is_const(),
+            Type::Type(c) => c.is_const(),
             Type::Data(..) => false, // Data types are not primitive constants
             _ => false,
         }
@@ -671,6 +664,14 @@ impl Type {
         }
     }
 
+    #[inline]
+    pub fn get_const_type(&self) -> Option<Arc<Type>> {
+        match self {
+            Self::Type(c) => c.get_const_value(),
+            _ => None,
+        }
+    }
+
     /// Helper function to determine cast kind based on range relationships
     fn range_cast_kind(from_range: CommonRange, to_range: CommonRange) -> CastKind {
         if to_range.contains(&from_range) {
@@ -690,6 +691,24 @@ impl Type {
         }
 
         match (self, target_type) {
+            // Bool casts - write out all cases
+            (Type::Bool(BoolConstraint::Const(a)), Type::Bool(BoolConstraint::Const(b))) => {
+                if a == b {
+                    CastKind::Static // Same constant
+                } else {
+                    CastKind::Invalid // Different constants (true ≠ false)
+                }
+            }
+            (Type::Bool(BoolConstraint::Const(_)), Type::Bool(BoolConstraint::Any)) => {
+                CastKind::Static // Const to Any is widening
+            }
+            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Const(_))) => {
+                CastKind::Dynamic // Any to Const needs runtime check
+            }
+            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Any)) => {
+                CastKind::Static // Any to Any (already handled by identity check above)
+            }
+
             // Signed to signed
             (Type::Int(_, from_constraint), Type::Int(_, to_constraint)) => Self::range_cast_kind(
                 CommonRange::from(*from_constraint),
@@ -716,21 +735,25 @@ impl Type {
                 CommonRange::from(*to_constraint),
             ),
 
-            // Bool casts - write out all cases
-            (Type::Bool(BoolConstraint::Const(a)), Type::Bool(BoolConstraint::Const(b))) => {
+            // Other cross-type casts (int/uint to float, etc.)
+            (Type::Int(..) | Type::UInt(..), Type::Float(..)) => CastKind::Dynamic,
+            (Type::Float(..), Type::Int(..) | Type::UInt(..)) => CastKind::Dynamic,
+
+            // Type casts - write out all cases
+            (Type::Type(TypeConstraint::Const(a)), Type::Type(TypeConstraint::Const(b))) => {
                 if a == b {
                     CastKind::Static // Same constant
                 } else {
                     CastKind::Invalid // Different constants (true ≠ false)
                 }
             }
-            (Type::Bool(BoolConstraint::Const(_)), Type::Bool(BoolConstraint::Any)) => {
+            (Type::Type(TypeConstraint::Const(_)), Type::Type(TypeConstraint::Any)) => {
                 CastKind::Static // Const to Any is widening
             }
-            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Const(_))) => {
+            (Type::Type(TypeConstraint::Any), Type::Type(TypeConstraint::Const(_))) => {
                 CastKind::Dynamic // Any to Const needs runtime check
             }
-            (Type::Bool(BoolConstraint::Any), Type::Bool(BoolConstraint::Any)) => {
+            (Type::Type(TypeConstraint::Any), Type::Type(TypeConstraint::Any)) => {
                 CastKind::Static // Any to Any (already handled by identity check above)
             }
 
@@ -761,10 +784,6 @@ impl Type {
                 }
             }
 
-            // Other cross-type casts (int/uint to float, etc.)
-            (Type::Int(..) | Type::UInt(..), Type::Float(..)) => CastKind::Dynamic,
-            (Type::Float(..), Type::Int(..) | Type::UInt(..)) => CastKind::Dynamic,
-
             // Special types
             (Type::Error(..), _) | (_, Type::Error(..)) => CastKind::Invalid,
             (Type::Control, _) | (_, Type::Control) => CastKind::Invalid,
@@ -786,6 +805,41 @@ impl Type {
 
             // Everything else is invalid
             _ => CastKind::Invalid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TypeConstraint {
+    Any,
+    Const(Arc<Type>),
+}
+
+impl TypeConstraint {
+    #[inline]
+    pub fn is_const(&self) -> bool {
+        return matches!(self, TypeConstraint::Const(..));
+    }
+
+    #[inline]
+    pub fn get_const_value(&self) -> Option<Arc<Type>> {
+        match self {
+            TypeConstraint::Const(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn compare(&self, other: &Self, op: CompareOp) -> Option<bool> {
+        match (self, other) {
+            (TypeConstraint::Const(a), TypeConstraint::Const(b)) => Some(match op {
+                CompareOp::Lt => a < b,
+                CompareOp::Gt => a > b,
+                CompareOp::LtEq => a <= b,
+                CompareOp::GtEq => a >= b,
+                CompareOp::Eq => a == b,
+                CompareOp::Neq => a != b,
+            }),
+            _ => None, // Conservative for non-constant floats
         }
     }
 }
@@ -1139,10 +1193,7 @@ mod tests {
         }
 
         // Test anonymous record
-        let record_type = Type::make_record(vec![
-            ("x", Type::I32),
-            ("y", Type::I32),
-        ]);
+        let record_type = Type::make_record(vec![("x", Type::I32), ("y", Type::I32)]);
         if let Type::Data(tag, fields) = record_type {
             assert_eq!(tag, None); // Anonymous
             assert_eq!(fields.len(), 2);
@@ -1153,10 +1204,13 @@ mod tests {
         }
 
         // Test named record
-        let user_type = Type::make_named_record("User", vec![
-            ("name", Type::I32), // Using I32 for simplicity in tests
-            ("age", Type::I32),
-        ]);
+        let user_type = Type::make_named_record(
+            "User",
+            vec![
+                ("name", Type::I32), // Using I32 for simplicity in tests
+                ("age", Type::I32),
+            ],
+        );
         if let Type::Data(tag, fields) = user_type {
             assert_eq!(tag, Some(intern_symbol("User")));
             assert_eq!(fields.len(), 2);
