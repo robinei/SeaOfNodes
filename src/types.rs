@@ -400,6 +400,11 @@ impl Type {
         }
 
         match (self, other) {
+            // Special lattice elements
+            (Type::Never, _) | (_, Type::Never) => Type::Never, // Bottom element
+            (Type::Any, other) => other.clone(),                // Top element (Any ∩ X = X)
+            (other, Type::Any) => other.clone(),                // Top element (X ∩ Any = X)
+
             (Type::Bool(lc), Type::Bool(rc)) => match (lc, rc) {
                 (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => self.clone(),
                 (BoolConstraint::Const(_), BoolConstraint::Const(_)) => Type::Never,
@@ -429,19 +434,33 @@ impl Type {
                 }
             }
 
-            // Data type intersections - handle struct coercion
+            (Type::Float(lc), Type::Float(rc)) => match (lc, rc) {
+                (FloatConstraint::Const(a), FloatConstraint::Const(b)) if a == b => self.clone(),
+                (FloatConstraint::Const(_), FloatConstraint::Const(_)) => Type::Never,
+                (FloatConstraint::Const(_), FloatConstraint::Any(_)) => self.clone(),
+                (FloatConstraint::Any(_), FloatConstraint::Const(_)) => other.clone(),
+                (FloatConstraint::Any(p1), FloatConstraint::Any(p2)) if p1 == p2 => self.clone(),
+                (FloatConstraint::Any(_), FloatConstraint::Any(_)) => Type::Never, // Different primitives
+            },
+
+            (Type::Type(lc), Type::Type(rc)) => match (lc, rc) {
+                (TypeConstraint::Const(a), TypeConstraint::Const(b)) if a == b => self.clone(),
+                (TypeConstraint::Const(_), TypeConstraint::Const(_)) => Type::Never,
+                (TypeConstraint::Const(_), TypeConstraint::Any) => self.clone(),
+                (TypeConstraint::Any, TypeConstraint::Const(_)) => other.clone(),
+                (TypeConstraint::Any, TypeConstraint::Any) => self.clone(),
+            },
+
+            // Data type intersections - mathematically sound intersection
             (Type::Data(tag1, fields1), Type::Data(tag2, fields2)) => {
                 if fields1 == fields2 {
                     match (tag1, tag2) {
-                        // Identical untagged structs
-                        (None, None) => self.clone(),
-                        // Identical tagged structs
-                        (Some(a), Some(b)) if a == b => self.clone(),
-                        // Auto-coercion cases
-                        (None, Some(_)) => other.clone(), // untagged -> tagged
-                        (Some(_), None) => other.clone(), // tagged -> untagged
-                        // Different tags with same fields -> incompatible
+                        // Identical types (including both None)
+                        _ if tag1 == tag2 => self.clone(),
+                        // Different specific tags -> incompatible
                         (Some(_), Some(_)) => Type::Never,
+                        // Tagged ∩ untagged -> untagged (most general common form)
+                        _ => Type::Data(None, fields1.clone()),
                     }
                 } else {
                     Type::Never // Different fields
@@ -467,20 +486,19 @@ impl Type {
 
                 for t in types.iter() {
                     let intersection = source.intersect(t);
-                    if !matches!(intersection, Type::Never) {
-                        match intersection {
-                            Type::Data(Some(_), _) => {
-                                tagged_count += 1;
-                                tagged_match = Some(intersection);
-                            }
-                            Type::Data(None, _) => {
-                                untagged_count += 1;
-                                untagged_match = Some(intersection);
-                            }
-                            other => {
-                                other_count += 1;
-                                other_match = Some(other);
-                            }
+                    match intersection {
+                        Type::Never => {} // Do nothing for Never
+                        Type::Data(Some(_), _) => {
+                            tagged_count += 1;
+                            tagged_match = Some(intersection);
+                        }
+                        Type::Data(None, _) => {
+                            untagged_count += 1;
+                            untagged_match = Some(intersection);
+                        }
+                        other => {
+                            other_count += 1;
+                            other_match = Some(other);
                         }
                     }
                 }
@@ -515,6 +533,12 @@ impl Type {
         }
 
         match (self, other) {
+            // Special lattice elements
+            (Type::Never, _) => Type::Never,  // Never - X = Never
+            (_, Type::Never) => self.clone(), // X - Never = X
+            (_, Type::Any) => Type::Never,    // X - Any = Never (subtract universal set)
+            (Type::Any, _) => Type::Any,      // Any - X = Any (universal - specific)
+
             (Type::Bool(lc), Type::Bool(rc)) => {
                 match (lc, rc) {
                     (BoolConstraint::Const(a), BoolConstraint::Const(b)) if a == b => Type::Never,
@@ -571,6 +595,23 @@ impl Type {
                 Type::make_union(ranges)
             }
 
+            (Type::Float(lc), Type::Float(rc)) => match (lc, rc) {
+                (FloatConstraint::Const(a), FloatConstraint::Const(b)) if a == b => Type::Never,
+                (FloatConstraint::Const(_), FloatConstraint::Const(_)) => self.clone(), // Different constants
+                (FloatConstraint::Const(_), FloatConstraint::Any(_)) => Type::Never, // Specific - universal = empty
+                (FloatConstraint::Any(_), FloatConstraint::Const(_)) => self.clone(), // Can't represent "all except X"
+                (FloatConstraint::Any(p1), FloatConstraint::Any(p2)) if p1 == p2 => Type::Never,
+                (FloatConstraint::Any(_), FloatConstraint::Any(_)) => self.clone(), // Different primitives
+            },
+
+            (Type::Type(lc), Type::Type(rc)) => match (lc, rc) {
+                (TypeConstraint::Const(a), TypeConstraint::Const(b)) if a == b => Type::Never,
+                (TypeConstraint::Const(_), TypeConstraint::Const(_)) => self.clone(), // Different constants
+                (TypeConstraint::Const(_), TypeConstraint::Any) => Type::Never, // Specific - universal = empty
+                (TypeConstraint::Any, TypeConstraint::Const(_)) => self.clone(), // Can't represent "all except X"
+                (TypeConstraint::Any, TypeConstraint::Any) => Type::Never,
+            },
+
             // Error subtraction
             (Type::Error(la, ..), Type::Error(ra, ..)) => {
                 let inner_subtraction = (**la).clone().subtract(&(**ra));
@@ -588,6 +629,11 @@ impl Type {
                     .filter(|t| !matches!(t, Type::Never))
                     .collect();
                 Type::make_union(subtracted)
+            }
+
+            // Subtract union from type: X - Union([A, B]) = X - A - B
+            (source, Type::Union(types, ..)) => {
+                types.iter().fold(source.clone(), |acc, t| acc.subtract(t))
             }
 
             // Different types → self unchanged
@@ -886,13 +932,23 @@ impl Type {
             (Type::Any, _) => CastKind::Dynamic,  // Any might be anything at runtime
             (_, Type::Any) => CastKind::Static,   // Everything can upcast to Any
 
-            // Data types - use intersection to check coercion compatibility
-            (Type::Data(..), Type::Data(..)) => {
-                let intersection = self.intersect(target_type);
-                if intersection == *target_type {
-                    CastKind::Static // Successful coercion
+            // Data types - handle struct coercion explicitly
+            (Type::Data(self_tag, self_fields), Type::Data(target_tag, target_fields)) => {
+                if self_fields == target_fields {
+                    match (self_tag, target_tag) {
+                        // Identical untagged
+                        (None, None) => CastKind::Static,
+                        // Identical tagged
+                        (Some(a), Some(b)) if a == b => CastKind::Static,
+                        // Untagged -> tagged (coercion)
+                        (None, Some(_)) => CastKind::Static,
+                        // Tagged -> untagged (coercion)
+                        (Some(_), None) => CastKind::Static,
+                        // Different tags with same fields -> invalid
+                        (Some(_), Some(_)) => CastKind::Invalid,
+                    }
                 } else {
-                    CastKind::Invalid // No coercion possible
+                    CastKind::Invalid // Different fields
                 }
             }
             (Type::Data(..), _) | (_, Type::Data(..)) => CastKind::Invalid,
@@ -1346,11 +1402,11 @@ mod tests {
         let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
         let tagged_vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
 
-        // Untagged -> Tagged coercion
+        // Tagged ∩ untagged -> untagged (most general common form)
         let intersection = untagged.intersect(&tagged_point);
-        assert_eq!(intersection, tagged_point);
+        assert_eq!(intersection, untagged);
 
-        // Tagged -> Untagged coercion
+        // Tagged ∩ untagged -> untagged (commutative)
         let intersection = tagged_point.intersect(&untagged);
         assert_eq!(intersection, untagged);
 
@@ -1419,10 +1475,10 @@ mod tests {
         let tagged_point = Type::Data(Some(intern_symbol("Point")), fields.clone());
         let tagged_vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
 
-        // Single match - should succeed
+        // Single match - should succeed with untagged result
         let union_single = Type::make_union(vec![tagged_point.clone(), Type::I32]);
         let intersection = untagged.intersect(&union_single);
-        assert_eq!(intersection, tagged_point);
+        assert_eq!(intersection, untagged); // Intersection gives untagged common form
 
         // Multiple tagged matches - should fail (ambiguous)
         let union_ambiguous = Type::make_union(vec![tagged_point.clone(), tagged_vector.clone()]);
@@ -1489,6 +1545,131 @@ mod tests {
         let intersection1 = untagged.intersect(&union);
         let intersection2 = union.intersect(&untagged);
         assert_eq!(intersection1, intersection2);
-        assert_eq!(intersection1, tagged_point);
+        assert_eq!(intersection1, untagged); // Intersection gives untagged common form
+    }
+
+    #[test]
+    fn test_float_type_fun_intersections() {
+        use ordered_float::OrderedFloat;
+
+        // Test Float intersection - Const ∩ Any
+        let float_const = Type::Float(FloatConstraint::Const(OrderedFloat(2.5)));
+        let float_any = Type::Float(FloatConstraint::Any(FloatPrim::F64));
+        assert_eq!(float_const.intersect(&float_any), float_const);
+        assert_eq!(float_any.intersect(&float_const), float_const); // Commutativity
+
+        // Test Type intersection - Const ∩ Any
+        let type_const = Type::Type(TypeConstraint::Const(Arc::new(Type::I32)));
+        let type_any = Type::Type(TypeConstraint::Any);
+        assert_eq!(type_const.intersect(&type_any), type_const);
+        assert_eq!(type_any.intersect(&type_const), type_const); // Commutativity
+
+        // Test Function intersection
+        let fun_info = Arc::new(FunInfo {
+            params: vec![],
+            return_type: Type::I32,
+        });
+        let fun1 = Type::Fun(fun_info.clone());
+        let fun2 = Type::Fun(fun_info.clone());
+        assert_eq!(fun1.intersect(&fun2), fun1); // Identical functions
+
+        // Test Any/Never lattice properties
+        assert_eq!(Type::Any.intersect(&Type::I32), Type::I32); // Any ∩ X = X
+        assert_eq!(Type::I32.intersect(&Type::Any), Type::I32); // X ∩ Any = X
+        assert_eq!(Type::Never.intersect(&Type::I32), Type::Never); // Never ∩ X = Never
+        assert_eq!(Type::I32.intersect(&Type::Never), Type::Never); // X ∩ Never = Never
+
+        // Test Any/Never subtraction properties
+        assert_eq!(Type::I32.subtract(&Type::Any), Type::Never); // X - Any = Never
+        assert_eq!(Type::Any.subtract(&Type::I32), Type::Any); // Any - X = Any (universal - specific)
+        assert_eq!(Type::Never.subtract(&Type::I32), Type::Never); // Never - X = Never
+        assert_eq!(Type::I32.subtract(&Type::Never), Type::I32); // X - Never = X
+
+        // Test union subtraction: X - Union([A, B]) = X - A - B
+        let union = Type::make_union(vec![Type::I32, Type::Bool(BoolConstraint::Any)]);
+        assert_eq!(Type::Any.subtract(&union), Type::Any); // Any - Union = Any
+
+        // Test range subtraction: [1,10] - Union([1,3], [8,10]) should leave [4,7]
+        let range = Type::Int(IntPrim::I32, IntConstraint::new(1, 10));
+        let union_ranges = Type::make_union(vec![
+            Type::Int(IntPrim::I32, IntConstraint::new(1, 3)),
+            Type::Int(IntPrim::I32, IntConstraint::new(8, 10)),
+        ]);
+        let result = range.subtract(&union_ranges);
+        // Should be [4,7]
+        if let Type::Int(_, constraint) = result {
+            assert_eq!(constraint.min, 4);
+            assert_eq!(constraint.max, 7);
+        } else {
+            panic!("Expected Int type, got {:?}", result);
+        }
+
+        // Test Float/Type subtraction completeness
+        let float_const = Type::Float(FloatConstraint::Const(OrderedFloat(2.5)));
+        let float_any = Type::Float(FloatConstraint::Any(FloatPrim::F64));
+        let type_const = Type::Type(TypeConstraint::Const(Arc::new(Type::I32)));
+        let type_any = Type::Type(TypeConstraint::Any);
+
+        // Same-domain subtraction: specific - universal = Never
+        assert_eq!(float_const.subtract(&float_any), Type::Never);
+        assert_eq!(type_const.subtract(&type_any), Type::Never);
+
+        // Same-domain subtraction: universal - specific = universal (can't represent complement)
+        assert_eq!(float_any.subtract(&float_const), float_any);
+        assert_eq!(type_any.subtract(&type_const), type_any);
+
+        // Cross-domain subtraction: should return original (no overlap)
+        assert_eq!(float_const.subtract(&type_any), float_const);
+        assert_eq!(type_const.subtract(&float_any), type_const);
+    }
+
+    #[test]
+    fn test_try_merge_types_completeness() {
+        use ordered_float::OrderedFloat;
+
+        // Test missing Float Const ∪ Const merging
+        let float_const1 = Type::Float(FloatConstraint::Const(OrderedFloat(2.5)));
+        let float_const2 = Type::Float(FloatConstraint::Const(OrderedFloat(3.0)));
+        let float_union = Type::make_union(vec![float_const1.clone(), float_const2.clone()]);
+        println!("Float(Const(2.5)) ∪ Float(Const(3.0)): {:?}", float_union);
+        // Should merge to Float(Any(F64)) but currently doesn't
+
+        // Test missing Type Const ∪ Const merging
+        let type_const1 = Type::Type(TypeConstraint::Const(Arc::new(Type::I32)));
+        let type_const2 = Type::Type(TypeConstraint::Const(Arc::new(Type::BOOL)));
+        let type_union = Type::make_union(vec![type_const1.clone(), type_const2.clone()]);
+        println!("Type(Const(i32)) ∪ Type(Const(bool)): {:?}", type_union);
+        // Should merge to Type(Any) but currently doesn't
+    }
+
+    #[test]
+    fn test_mathematically_sound_data_intersection() {
+        use crate::symbols::intern_symbol;
+
+        let fields: Arc<[DataField]> = vec![
+            DataField {
+                name: intern_symbol("x"),
+                ty: Type::I32,
+            },
+            DataField {
+                name: intern_symbol("y"),
+                ty: Type::I32,
+            },
+        ]
+        .into();
+
+        let untagged = Type::Data(None, fields.clone());
+        let point = Type::Data(Some(intern_symbol("Point")), fields.clone());
+        let vector = Type::Data(Some(intern_symbol("Vector")), fields.clone());
+
+        // Test mathematical consistency: if A ∩ C = X and B ∩ C = Y, then A ∩ B should be consistent
+        assert_eq!(point.intersect(&untagged), untagged); // Point ∩ untagged = untagged
+        assert_eq!(vector.intersect(&untagged), untagged); // Vector ∩ untagged = untagged
+        assert_eq!(point.intersect(&vector), Type::Never); // Point ∩ Vector = Never (consistent!)
+
+        // Test commutativity
+        assert_eq!(point.intersect(&untagged), untagged.intersect(&point));
+        assert_eq!(vector.intersect(&untagged), untagged.intersect(&vector));
+        assert_eq!(point.intersect(&vector), vector.intersect(&point));
     }
 }
