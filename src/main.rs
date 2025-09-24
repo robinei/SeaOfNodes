@@ -25,10 +25,10 @@ struct NodeListEntry {
 pub enum NodeKind {
     Unreachable,
 
-    // fake node which contains the ID of an interned node (in data.interned_id).
+    // fake node which contains the ID of node which is stored in the nodes array (in data.identity_id).
     // lets us use the Node value based interface even for nodes with identity
     // inputs: none
-    Interned,
+    Identity,
 
     // function parameter (just an index stored in data.param_index).
     // inputs: none
@@ -74,6 +74,16 @@ pub enum NodeKind {
     DynamicCast, // cast requiring runtime type check
 }
 
+impl NodeKind {
+    pub fn is_pure(self) -> bool {
+        use NodeKind::*;
+        matches!(
+            self,
+            Const | Neg | Not | Add | Sub | Mul | Div | StaticCast | DynamicCast
+        )
+    }
+}
+
 #[derive(Copy, Clone)]
 union NodeData {
     // only access inputs if inputs_count > 0. if inputs_count > 4 then inputs[3] is a link index for chaining more inputs
@@ -81,7 +91,7 @@ union NodeData {
 
     param_index: usize,
 
-    interned_id: NodeId,
+    identity_id: NodeId,
 }
 
 impl std::fmt::Debug for NodeData {
@@ -171,9 +181,9 @@ impl Node {
     }
 
     #[inline]
-    pub fn get_interned_id(&self) -> Option<NodeId> {
-        if self.kind == NodeKind::Interned {
-            Some(unsafe { self.data.interned_id })
+    pub fn get_identity_id(&self) -> Option<NodeId> {
+        if self.kind == NodeKind::Identity {
+            Some(unsafe { self.data.identity_id })
         } else {
             None
         }
@@ -216,7 +226,6 @@ pub struct IRBuilder {
     list_entries: Vec<NodeListEntry>,
     interned_nodes: HashMap<Node, NodeId>,
     interned_list_entries: HashMap<NodeListEntry, usize>,
-    current_control: NodeId,
 }
 
 impl IRBuilder {
@@ -230,44 +239,50 @@ impl IRBuilder {
             list_entries: Vec::new(),
             interned_nodes: HashMap::new(),
             interned_list_entries: HashMap::new(),
-            current_control: 1, // start node
         }
     }
 
     #[inline]
-    fn lookup(&self, id: NodeId) -> &Node {
+    fn lookup_node(&self, id: NodeId) -> &Node {
         &self.nodes[id as usize]
     }
 
     #[inline]
-    fn resolve<'a>(&'a self, node: &'a Node) -> &Node {
-        if let Some(interned_id) = node.get_interned_id() {
-            &self.nodes[interned_id as usize]
+    fn push_node(&mut self, node: &Node) -> NodeId {
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(node.clone());
+        id
+    }
+
+    #[inline]
+    fn get_node_id(&mut self, node: &Node) -> NodeId {
+        if let Some(identity_id) = node.get_identity_id() {
+            identity_id
+        } else if node.kind.is_pure() {
+            if let Some(interned_id) = self.interned_nodes.get(&node) {
+                *interned_id
+            } else {
+                let interned_id = self.push_node(node);
+                self.interned_nodes.insert(node.clone(), interned_id);
+                interned_id
+            }
         } else {
-            // TODO: check if we have a refinement node registered for this node (will use to let conditionals refine values in the branches)
-            node
+            panic!("can't intern impure node - they need to have identity")
         }
     }
 
     #[inline]
-    fn intern(&mut self, node: &Node) -> NodeId {
-        if let Some(interned_id) = node.get_interned_id() {
-            interned_id
+    fn resolve_if_identity_node<'a>(&'a self, node: &'a Node) -> &Node {
+        if let Some(identity_id) = node.get_identity_id() {
+            &self.nodes[identity_id as usize]
         } else {
-            if let Some(interned_id) = self.interned_nodes.get(node) {
-                *interned_id
-            } else {
-                let interned_id = self.nodes.len() as NodeId;
-                self.nodes.push(node.clone());
-                self.interned_nodes.insert(node.clone(), interned_id);
-                interned_id
-            }
+            node
         }
     }
 
     pub fn create_add(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
-        let l = self.resolve(lhs);
-        let r = self.resolve(rhs);
+        let l = self.resolve_if_identity_node(lhs);
+        let r = self.resolve_if_identity_node(rhs);
 
         let t = l.t.add(&r.t)?;
 
@@ -288,24 +303,24 @@ impl IRBuilder {
             self.create_add(rhs, lhs)?
         } else if r.kind == NodeKind::Neg {
             // x + (-y) => x - y
-            let y = self.lookup(r.get_input(1)).clone(); // Neg has input at index 1
+            let y = self.lookup_node(r.get_input(1)).clone(); // Neg has input at index 1
             self.create_sub(lhs, &y)?
         } else if r.kind == NodeKind::Add {
             // x + (y + z) => (x + y) + z
-            let y = self.lookup(r.get_input(1)).clone(); // Left operand at index 1
-            let z = self.lookup(r.get_input(2)).clone(); // Right operand at index 2
+            let y = self.lookup_node(r.get_input(1)).clone(); // Left operand at index 1
+            let z = self.lookup_node(r.get_input(2)).clone(); // Right operand at index 2
             let xy = self.create_add(lhs, &y)?;
             self.create_add(&xy, &z)?
         } else {
             let mut node = Node::new(NodeKind::Add, t);
-            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]);
+            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]);
             node
         })
     }
 
     pub fn create_sub(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
-        let l = self.resolve(lhs);
-        let r = self.resolve(rhs);
+        let l = self.resolve_if_identity_node(lhs);
+        let r = self.resolve_if_identity_node(rhs);
 
         let t = l.t.sub(&r.t)?;
 
@@ -320,24 +335,24 @@ impl IRBuilder {
             Node::num_of_type(0, &t)
         } else if r.kind == NodeKind::Neg {
             // x - (-y) => x + y
-            let y = self.lookup(r.get_input(1)).clone();
+            let y = self.lookup_node(r.get_input(1)).clone();
             self.create_add(lhs, &y)?
         } else if r.kind == NodeKind::Sub {
             // x - (y - z) => x - y + z => (x + z) - y
-            let y = self.lookup(r.get_input(1)).clone(); // Left operand at index 1
-            let z = self.lookup(r.get_input(2)).clone(); // Right operand at index 2
+            let y = self.lookup_node(r.get_input(1)).clone(); // Left operand at index 1
+            let z = self.lookup_node(r.get_input(2)).clone(); // Right operand at index 2
             let xz = self.create_add(lhs, &z)?;
             self.create_sub(&xz, &y)?
         } else {
             let mut node = Node::new(NodeKind::Sub, t);
-            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
 
     pub fn create_mul(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
-        let l = self.resolve(lhs);
-        let r = self.resolve(rhs);
+        let l = self.resolve_if_identity_node(lhs);
+        let r = self.resolve_if_identity_node(rhs);
 
         let t = l.t.mul(&r.t)?;
 
@@ -356,21 +371,21 @@ impl IRBuilder {
         } else if l == r {
             // x * x => x^2 (no special peephole for now)
             let mut node = Node::new(NodeKind::Mul, t);
-            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]);
+            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]);
             node
         } else if l.kind != NodeKind::Mul && r.kind == NodeKind::Mul {
             // non-mul * mul => mul * non-mul (canonicalize)
             self.create_mul(rhs, lhs)?
         } else {
             let mut node = Node::new(NodeKind::Mul, t);
-            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
 
     pub fn create_div(&mut self, lhs: &Node, rhs: &Node) -> Result<Node, IRError> {
-        let l = self.resolve(lhs);
-        let r = self.resolve(rhs);
+        let l = self.resolve_if_identity_node(lhs);
+        let r = self.resolve_if_identity_node(rhs);
 
         let t = l.t.div(&r.t)?;
 
@@ -388,15 +403,52 @@ impl IRBuilder {
             Node::num_of_type(1, &t)
         } else {
             let mut node = Node::new(NodeKind::Div, t);
-            node.set_inputs(&[0, self.intern(lhs), self.intern(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
 
-    pub fn create_if(&mut self, cond: &Node) -> Node {
+    pub fn create_if(&mut self, control: NodeId, cond: &Node) -> NodeId {
         let mut node = Node::new(NodeKind::If, Type::Control);
-        node.set_inputs(&[self.current_control, self.intern(cond)]);
-        node
+        node.set_inputs(&[control, self.get_node_id(cond)]);
+        self.push_node(&node)
+    }
+
+    pub fn create_then(&mut self, if_node: NodeId) -> NodeId {
+        let mut node = Node::new(NodeKind::Then, Type::Control);
+        node.set_inputs(&[if_node]);
+        self.push_node(&node)
+    }
+
+    pub fn create_else(&mut self, if_node: NodeId) -> NodeId {
+        let mut node = Node::new(NodeKind::Else, Type::Control);
+        node.set_inputs(&[if_node]);
+        self.push_node(&node)
+    }
+
+    pub fn create_loop(&mut self, control: NodeId) -> NodeId {
+        let mut node = Node::new(NodeKind::Loop, Type::Control);
+        node.set_inputs(&[control]);
+        self.push_node(&node)
+    }
+
+    pub fn create_region(&mut self, controls: &[NodeId]) -> NodeId {
+        assert!(controls.len() <= 4, "Too many region inputs");
+
+        let mut node = Node::new(NodeKind::Region, Type::Control);
+        node.inputs_count = controls.len() as u16;
+
+        unsafe {
+            for (i, control) in controls.iter().enumerate() {
+                node.data.inputs[i] = *control;
+            }
+            // Zero out unused slots
+            for i in controls.len()..4 {
+                node.data.inputs[i] = 0;
+            }
+        }
+
+        self.push_node(&node)
     }
 
     pub fn create_cast(&mut self, value: &Node, target_type: Type) -> Result<Node, IRError> {
@@ -410,7 +462,7 @@ impl IRBuilder {
                 } else {
                     // Safe cast, create StaticCast node
                     let mut node = Node::new(NodeKind::StaticCast, target_type);
-                    node.set_inputs(&[0, self.intern(value)]);
+                    node.set_inputs(&[0, self.get_node_id(value)]);
                     Ok(node)
                 }
             }
@@ -418,7 +470,7 @@ impl IRBuilder {
             CastKind::Dynamic => {
                 // Runtime check required, create DynamicCast node
                 let mut node = Node::new(NodeKind::DynamicCast, target_type);
-                node.set_inputs(&[0, self.intern(value)]);
+                node.set_inputs(&[0, self.get_node_id(value)]);
                 Ok(node)
             }
 
@@ -531,12 +583,12 @@ mod tests {
         let result = builder.create_add(&x, &x).unwrap();
         assert_eq!(result.kind, NodeKind::Mul);
         // Should be x * 2
-        let mul_rhs = builder.lookup(result.get_input(2)); // Right operand is at index 2
+        let mul_rhs = builder.lookup_node(result.get_input(2)); // Right operand is at index 2
         assert_eq!(mul_rhs.t.get_const_int(), Some(2));
 
         // Test double negation: x - (-y) => x + y
         let mut neg_x = Node::new(NodeKind::Neg, Type::I32);
-        neg_x.set_inputs(&[0, builder.intern(&x)]); // 0 = no control, x as operand
+        neg_x.set_inputs(&[0, builder.get_node_id(&x)]); // 0 = no control, x as operand
         let _result = builder.create_sub(&two, &neg_x);
         // This should recursively call create_add, but we can't easily test without more setup
     }
