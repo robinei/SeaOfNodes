@@ -307,6 +307,12 @@ struct VariableState {
     current_def: HashMap<NodeId, NodeId>, // control node -> reaching value
 }
 
+/// Built-in variable index for the implicit memory chain.
+/// Memory is tracked as an ordinary SSA variable (VarId 0), sharing the same
+/// Braun-style recursive lookup, Phi insertion, and trivial Phi elimination
+/// used for all other variables.
+pub const MEMORY_VAR: VarId = VarId(0);
+
 pub struct IRBuilder {
     nodes: Vec<Node>,
     node_outputs: Vec<OutputsVec>,
@@ -315,10 +321,6 @@ pub struct IRBuilder {
     variables: Vec<VariableState>,
     sealed: HashSet<NodeId>,
     incomplete_phis: HashMap<(VarId, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
-
-    // Memory SSA tracking — same Braun-style algorithm as variables, but for memory
-    memory_current_def: HashMap<NodeId, NodeId>, // control node -> reaching memory
-    incomplete_memory_phis: HashMap<NodeId, NodeId>, // control node -> operandless memory Phi
 }
 
 impl IRBuilder {
@@ -334,15 +336,19 @@ impl IRBuilder {
             node_outputs: vec![OutputsVec::new(), OutputsVec::new(), OutputsVec::new()],
             interned_nodes: HashMap::new(),
             current_control: NodeId(1), // Entry
-            variables: Vec::new(),
+            // Variable 0 is reserved for the implicit memory chain
+            variables: vec![VariableState {
+                name: "$memory".to_string(),
+                current_def: HashMap::new(),
+            }],
             sealed: HashSet::new(),
             incomplete_phis: HashMap::new(),
-            memory_current_def: HashMap::new(),
-            incomplete_memory_phis: HashMap::new(),
         };
-        let mem_id = NodeId(2);
         builder.sealed.insert(NodeId(1)); // Entry is sealed from the start
-        builder.memory_current_def.insert(NodeId(1), mem_id); // Entry reaches Memory node
+        // At Entry, the reaching memory is the Memory root node (node 2)
+        builder.variables[MEMORY_VAR.as_usize()]
+            .current_def
+            .insert(NodeId(1), NodeId(2));
         builder
     }
 
@@ -431,6 +437,7 @@ impl IRBuilder {
     }
 
     /// Allocate a new source variable with a human-readable name.
+    /// Returns a VarId starting from 1 (VarId(0) is reserved for the memory chain).
     pub fn create_variable(&mut self, name: &str) -> VarId {
         let idx = self.variables.len();
         self.variables.push(VariableState {
@@ -523,7 +530,11 @@ impl IRBuilder {
             operand_types.push(self.nodes[val.as_usize()].t.clone());
         }
         // Refine Phi's type: join of all operand types
-        if operand_types.is_empty() {
+        // For memory Phis, the type is always Memory regardless of operand types
+        // (memory operands are tokens in a chain, their node types are irrelevant)
+        if var == MEMORY_VAR {
+            self.nodes[phi_id.as_usize()].t = Type::Memory;
+        } else if operand_types.is_empty() {
             self.nodes[phi_id.as_usize()].t = Type::Never;
         } else if operand_types.iter().all(|t| *t == operand_types[0]) {
             self.nodes[phi_id.as_usize()].t = operand_types[0].clone();
@@ -575,117 +586,21 @@ impl IRBuilder {
         replacement
     }
 
-        // ── Memory SSA Methods ──
-    // These mirror the variable Braun SSA methods but for the implicit memory chain.
-    // Only one "variable" (memory itself) is tracked.
+        // ── Memory Convenience Methods ──
+    // Memory is tracked as an ordinary SSA variable (MEMORY_VAR = VarId(0)).
+    // These are thin wrappers for readability.
 
     /// Read the current memory at the current control point.
-    /// Inserts memory Phis as needed (Braun-style lazy SSA construction).
+    /// Inserts memory Phis as needed (same Braun algorithm as variables).
+    #[inline]
     pub fn get_current_memory(&mut self) -> NodeId {
-        self.lookup_memory(self.current_control)
+        self.read_variable(MEMORY_VAR)
     }
 
     /// Set the current memory at the current control point.
+    #[inline]
     pub fn set_current_memory(&mut self, mem: NodeId) {
-        self.memory_current_def.insert(self.current_control, mem);
-    }
-
-    /// Internal: look up memory at a specific control point, recursing backward if needed.
-    fn lookup_memory(&mut self, ctrl: NodeId) -> NodeId {
-        if let Some(&mem) = self.memory_current_def.get(&ctrl) {
-            return mem;
-        }
-        self.read_memory_recursive(ctrl)
-    }
-
-    /// Braun-style backward search for the reaching memory definition.
-    fn read_memory_recursive(&mut self, ctrl: NodeId) -> NodeId {
-        if !self.sealed.contains(&ctrl) {
-            // Incomplete CFG: place an operandless memory Phi and record it as incomplete
-            let phi = self.create_phi_node(ctrl, &[]);
-            let phi_id = self.push_node(&phi);
-            self.incomplete_memory_phis.insert(ctrl, phi_id);
-            self.memory_current_def.insert(ctrl, phi_id);
-            return phi_id;
-        }
-
-        let preds = self.get_control_predecessors(ctrl);
-        if preds.is_empty() {
-            // No predecessors (e.g., Entry): no reaching memory → NodeId(0) (Unreachable)
-            self.memory_current_def.insert(ctrl, NodeId(0));
-            return NodeId(0);
-        }
-        if preds.len() == 1 {
-            // Single predecessor: just recurse, no Phi needed
-            let mem = self.lookup_memory(preds[0]);
-            self.memory_current_def.insert(ctrl, mem);
-            return mem;
-        }
-
-        // Multiple predecessors: place operandless Phi to break cycles, then fill operands
-        let phi = self.create_phi_node(ctrl, &[]);
-        let phi_id = self.push_node(&phi);
-        self.memory_current_def.insert(ctrl, phi_id);
-        let val = self.add_memory_phi_operands(phi_id, ctrl);
-        self.memory_current_def.insert(ctrl, val);
-        val
-    }
-
-    /// Fill operands of a newly-created memory Phi by recursively reading memory from each predecessor.
-    fn add_memory_phi_operands(&mut self, phi_id: NodeId, ctrl: NodeId) -> NodeId {
-        let preds = self.get_control_predecessors(ctrl);
-        for &pred in &preds {
-            let mem = self.lookup_memory(pred);
-            // Append operand to Phi
-            self.nodes[phi_id.as_usize()].push_input(mem);
-            // Register phi_id as a user of mem
-            self.node_outputs[mem.as_usize()].push(phi_id.0);
-        }
-        // Memory Phis always have Type::Memory
-        self.nodes[phi_id.as_usize()].t = Type::Memory;
-        self.try_remove_trivial_memory_phi(phi_id)
-    }
-
-    /// Detect and remove a trivial memory Phi.
-    /// A memory Phi is trivial if it merges the same memory state (possibly with self-references).
-    fn try_remove_trivial_memory_phi(&mut self, phi_id: NodeId) -> NodeId {
-        let mut same: Option<NodeId> = None;
-        let phi = &self.nodes[phi_id.as_usize()];
-
-        // Skip input[0] (the control region); only consider memory operands
-        for i in 1..phi.inputs_len() {
-            let op = phi.get_input(i);
-            if op == phi_id || Some(op) == same {
-                continue;
-            }
-            if same.is_some() {
-                return phi_id; // At least two distinct memory states: not trivial
-            }
-            same = Some(op);
-        }
-
-        let replacement = match same {
-            Some(v) => v,
-            None => NodeId(0), // Phi references only itself → Unreachable
-        };
-
-        // Snapshot phi's users before rerouting
-        let phi_users: Vec<NodeId> = self.node_outputs[phi_id.as_usize()].iter().map(|x| NodeId(x)).collect();
-
-        // Reroute all uses of phi to replacement
-        self.replace_all_uses(phi_id, replacement);
-
-        // Recursively check Phi users that might have become trivial
-        for &user_id in &phi_users {
-            if user_id != phi_id {
-                let kind = self.nodes[user_id.as_usize()].kind;
-                if kind == NodeKind::Phi {
-                    self.try_remove_trivial_memory_phi(user_id);
-                }
-            }
-        }
-
-        replacement
+        self.write_variable(MEMORY_VAR, mem);
     }
 
     /// Get the control predecessors of a control node.
@@ -719,11 +634,12 @@ impl IRBuilder {
     }
 
     /// Seal a control node — no more predecessors will be added.
-    /// Fills in any incomplete Phis (both variable and memory) that were placed before sealing.
+    /// Fills in any incomplete Phis (including memory Phis, since memory is VarId 0)
+    /// that were placed before sealing.
     pub fn seal(&mut self, ctrl: NodeId) {
         self.sealed.insert(ctrl);
 
-        // Collect incomplete variable Phis for this block and fill their operands
+        // Collect incomplete Phis for this block and fill their operands
         let keys_to_fill: Vec<(VarId, NodeId)> = self
             .incomplete_phis
             .keys()
@@ -736,20 +652,6 @@ impl IRBuilder {
             let (var, _) = key;
             let result = self.add_phi_operands(var, phi_id, ctrl);
             self.variables[var.as_usize()].current_def.insert(ctrl, result);
-        }
-
-        // Collect incomplete memory Phis for this block and fill their operands
-        let mem_keys: Vec<NodeId> = self
-            .incomplete_memory_phis
-            .keys()
-            .filter(|&&c| c == ctrl)
-            .cloned()
-            .collect();
-
-        for mem_ctrl in mem_keys {
-            let phi_id = self.incomplete_memory_phis.remove(&mem_ctrl).unwrap();
-            let result = self.add_memory_phi_operands(phi_id, ctrl);
-            self.memory_current_def.insert(ctrl, result);
         }
     }
 
@@ -1002,8 +904,10 @@ impl IRBuilder {
         let mut node = Node::new(NodeKind::New, alloc_type);
         node.set_inputs(&[control, mem]);
         let id = self.push_node(&node);
-        // New produces a new memory state — update the memory chain
-        self.memory_current_def.insert(control, id);
+        // New produces a new memory state — update the memory variable
+        self.variables[MEMORY_VAR.as_usize()]
+            .current_def
+            .insert(control, id);
         id
     }
 
@@ -1034,8 +938,10 @@ impl IRBuilder {
         let mut node = Node::new(NodeKind::Store, Type::Memory);
         node.set_inputs(&[control, mem, ptr, value]);
         let id = self.push_node(&node);
-        // Store produces a new memory state — update the memory chain
-        self.memory_current_def.insert(control, id);
+        // Store produces a new memory state — update the memory variable
+        self.variables[MEMORY_VAR.as_usize()]
+            .current_def
+            .insert(control, id);
         id
     }
 }
@@ -1459,7 +1365,7 @@ mod tests {
 
         // Create a variable
         let v = builder.create_variable("x");
-        assert_eq!(v, VarId(0));
+        assert_eq!(v, VarId(1)); // VarId(0) is reserved for memory
 
         // Set control to something else
         builder.set_control(NodeId(1)); // Entry
@@ -2299,16 +2205,16 @@ mod tests {
         // Read memory at unsealed loop — creates an incomplete memory Phi
         let _mem_at_loop = builder.get_current_memory();
 
-        // The incomplete_memory_phis should have an entry
-        assert!(builder.incomplete_memory_phis.contains_key(&loop_ctrl));
+        // The incomplete_phis should have an entry for MEMORY_VAR at this control
+        assert!(builder.incomplete_phis.contains_key(&(MEMORY_VAR, loop_ctrl)));
 
         // Create back-edge and seal
         let back_edge = builder.create_region(&[loop_ctrl]);
         builder.push_loop_back_edge(loop_ctrl, back_edge);
         builder.seal(loop_ctrl);
 
-        // After sealing, the incomplete memory Phi should have been filled
-        assert!(!builder.incomplete_memory_phis.contains_key(&loop_ctrl));
+        // After sealing, the incomplete Phi should have been filled
+        assert!(!builder.incomplete_phis.contains_key(&(MEMORY_VAR, loop_ctrl)));
 
         // Memory at loop should be resolved (either Memory root, or a trivial Phi collapsed)
         let mem = builder.get_current_memory();
