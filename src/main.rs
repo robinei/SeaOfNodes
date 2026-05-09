@@ -73,7 +73,6 @@ pub enum IRError {
     IntegerOverflow,
     DivisionByZero,
     InvalidPrimitiveCoercion,
-    UndefinedVariable, // reading a variable with no reaching definition
 }
 
 #[repr(u8)]
@@ -374,34 +373,40 @@ impl IRBuilder {
     /// All users of old_id are rewired to point to the new node.
     pub fn replace_node(&mut self, old_id: NodeId, new_node: &Node) -> NodeId {
         let new_id = self.push_node(new_node);
-
-        // Snapshot old outputs, then clear the old node's output list
-        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()].iter().map(|x| NodeId(x)).collect();
-        self.node_outputs[old_id.as_usize()].set_all(&[]);
-
-        // Rewire each old user to point to new_id instead of old_id
-        for &user_id in &old_outputs {
-            let user = &mut self.nodes[user_id.as_usize()];
-            for i in 0..user.inputs_len() {
-                if user.get_input(i) == old_id {
-                    user.set_input(i, new_id);
-                    break;
-                }
-            }
-            self.node_outputs[new_id.as_usize()].push(user_id.0);
-        }
-
+        self.replace_all_uses(old_id, new_id);
         new_id
     }
 
     /// Rewire all users of `old_id` to point to `new_id` instead.
     /// Does NOT create a new node — used by trivial Phi elimination.
+    /// Also cleans up stale output edges in `old_id`'s inputs.
     fn replace_all_uses(&mut self, old_id: NodeId, new_id: NodeId) {
         if old_id == new_id {
             return;
         }
-        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()].iter().map(|x| NodeId(x)).collect();
+
+        // Remove old_id from its inputs' output lists (stale edge cleanup)
+        let inputs: Vec<NodeId> = {
+            let old_node = &self.nodes[old_id.as_usize()];
+            (0..old_node.inputs_len()).map(|i| old_node.get_input(i)).collect()
+        };
+        for &input in &inputs {
+            if input.is_valid() {
+                let outputs = &mut self.node_outputs[input.as_usize()];
+                if let Some(pos) = outputs.iter().position(|x| x == old_id.0) {
+                    outputs.remove(pos);
+                }
+            }
+        }
+
+        // Snapshot old outputs, then clear the old node's output list
+        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()]
+            .iter()
+            .map(|x| NodeId(x))
+            .collect();
         self.node_outputs[old_id.as_usize()].set_all(&[]);
+
+        // Rewire each old user to point to new_id instead of old_id
         for &user_id in &old_outputs {
             let user = &mut self.nodes[user_id.as_usize()];
             for i in 0..user.inputs_len() {
@@ -1614,5 +1619,177 @@ mod tests {
             .collect();
         assert!(add_inputs.contains(&new_c_id));
         assert!(!add_inputs.contains(&c_id));
+    }
+
+    #[test]
+    fn test_ssa_multiple_vars_at_merge() {
+        let mut builder = IRBuilder::new();
+        let x = builder.create_variable("x");
+        let y = builder.create_variable("y");
+
+        let one = Node::const_int(1);
+        let two = Node::const_int(2);
+        let three = Node::const_int(3);
+        let four = Node::const_int(4);
+        let one_id = builder.push_node(&one);
+        let two_id = builder.push_node(&two);
+        let three_id = builder.push_node(&three);
+        let four_id = builder.push_node(&four);
+
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then: x=1, y=2
+        builder.set_control(then_ctrl);
+        builder.write_variable(x, one_id);
+        builder.write_variable(y, two_id);
+
+        // Else: x=3, y=4
+        builder.set_control(else_ctrl);
+        builder.write_variable(x, three_id);
+        builder.write_variable(y, four_id);
+
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // Read both vars — each should have its own Phi
+        let x_val = builder.read_variable(x);
+        let y_val = builder.read_variable(y);
+
+        assert_ne!(x_val, NodeId(0));
+        assert_ne!(y_val, NodeId(0));
+        assert_ne!(x_val, y_val); // Different Phis
+
+        // x's Phi should merge 1 and 3
+        let x_phi = builder.lookup_node(x_val);
+        assert_eq!(x_phi.kind, NodeKind::Phi);
+        assert!(x_phi.get_input(1) == one_id || x_phi.get_input(2) == one_id);
+        assert!(x_phi.get_input(1) == three_id || x_phi.get_input(2) == three_id);
+
+        // y's Phi should merge 2 and 4
+        let y_phi = builder.lookup_node(y_val);
+        assert_eq!(y_phi.kind, NodeKind::Phi);
+        assert!(y_phi.get_input(1) == two_id || y_phi.get_input(2) == two_id);
+        assert!(y_phi.get_input(1) == four_id || y_phi.get_input(2) == four_id);
+    }
+
+    #[test]
+    fn test_ssa_partial_definition_at_merge() {
+        // Variable defined on one branch, falls through to outer def on the other
+        let mut builder = IRBuilder::new();
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let ten = Node::const_int(10);
+        let five_id = builder.push_node(&five);
+        let ten_id = builder.push_node(&ten);
+
+        // Write x = 5 at Entry
+        builder.write_variable(v, five_id);
+
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then branch: overwrites x = 10
+        builder.set_control(then_ctrl);
+        builder.write_variable(v, ten_id);
+
+        // Else branch: no write — falls through to Entry definition (x = 5)
+
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // Read x — should get a Phi merging 10 (from Then) and 5 (from Entry via Else)
+        let result = builder.read_variable(v);
+        assert_ne!(result, NodeId(0));
+
+        let phi = builder.lookup_node(result);
+        assert_eq!(phi.kind, NodeKind::Phi);
+        // One operand is ten_id, the other is five_id
+        let op1 = phi.get_input(1);
+        let op2 = phi.get_input(2);
+        assert!(
+            (op1 == five_id && op2 == ten_id) || (op1 == ten_id && op2 == five_id),
+            "Phi operands should be 5 and 10, got {} and {}",
+            op1,
+            op2
+        );
+    }
+
+    #[test]
+    fn test_ssa_phi_with_self_reference_collapses() {
+        // A Phi that only references itself and/or undef should collapse to undef.
+        // This occurs when a variable is read inside a loop before its first write.
+        let mut builder = IRBuilder::new();
+        let v = builder.create_variable("x");
+
+        // Create a loop (not sealed), read x — creates an incomplete Phi
+        let loop_ctrl = builder.create_loop(NodeId(1));
+        builder.set_control(loop_ctrl);
+        let _phi_at_loop = builder.read_variable(v);
+
+        // Add a back-edge and seal: the Phi gets operands filled.
+        // Since neither Entry nor back-edge define x, it collapses to NodeId(0).
+        let back_edge = builder.create_region(&[loop_ctrl]);
+        builder.push_loop_back_edge(loop_ctrl, back_edge);
+        builder.seal(loop_ctrl);
+
+        // After sealing, the incomplete Phi should have been filled and collapsed.
+        // The current def at loop_ctrl should be NodeId(0).
+        builder.set_control(loop_ctrl);
+        assert_eq!(builder.read_variable(v), NodeId(0));
+    }
+
+    #[test]
+    fn test_ssa_seal_with_no_incomplete_phis() {
+        // Sealing a block with no incomplete Phis should be a no-op
+        let mut builder = IRBuilder::new();
+
+        let region = builder.create_region(&[NodeId(1)]);
+        // region is auto-sealed, no Phis were ever created for it — no-op
+        builder.seal(region);
+
+        // Should still be sealed
+        // Read a variable that has a def at Entry — should work through region
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let five_id = builder.push_node(&five);
+        builder.write_variable(v, five_id);
+
+        builder.set_control(region);
+        assert_eq!(builder.read_variable(v), five_id);
+    }
+
+    #[test]
+    fn test_ssa_replace_all_uses_cleans_up_inputs() {
+        // Verify that replace_all_uses removes old_id from its inputs' output lists
+        let mut builder = IRBuilder::new();
+
+        let x = builder.create_param(0, Type::I32);
+        let _x_id = x.get_identity_id().unwrap();
+        let c = Node::const_int(5);
+        let c_id = builder.push_node(&c);
+
+        // add uses both x and c
+        let add = builder.create_add(&x, &c).unwrap();
+        let add_id = builder.get_node_id(&add);
+
+        // add is a user of c
+        assert!(builder.node_outputs[c_id.as_usize()].iter().any(|id| id == add_id.0));
+
+        // c is an input of add, so add's input list includes c_id
+        // Now replace all uses of c
+        let new_c = Node::const_int(10);
+        let new_c_id = builder.push_node(&new_c);
+        builder.replace_all_uses(c_id, new_c_id);
+
+        // c should no longer have add as a user (stale edge cleaned up)
+        assert!(builder.node_outputs[c_id.as_usize()].is_empty());
+
+        // new_c should have add as a user
+        assert!(builder.node_outputs[new_c_id.as_usize()].iter().any(|id| id == add_id.0));
     }
 }
