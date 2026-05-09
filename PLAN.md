@@ -12,10 +12,26 @@ A `Display` or Debug that emits Graphviz `.dot` output. Debugging graph IRs
 by reading node arrays is painful. Visualization accelerates all future work.
 
 ### Memory peephole optimizations
-Fold `Load` immediately after `Store` to same ptr → return stored value.
-Fold `Load` from `New` before any `Store` → return zero/undef initial value.
-Eliminate dead `Store` chains (store to ptr that is never subsequently loaded).
-These are the memory equivalent of the arithmetic peepholes we already have.
+
+**Phase 1 — Load-Store forwarding** ✅ Done
+`Load(mem, ptr)` where `mem` is `Store(_, _, ptr, value)` at same ptr
+→ return `value` directly, no Load node created.
+
+**Phase 2 — Eager dead Store elimination**
+During `create_store(mem, ptr, value)`: if `mem` is `Store(mem', ptr, value')`
+and the old Store has no Load users reading the same ptr, skip the
+intermediate Store and chain directly off `mem'`. Catches the adjacent case.
+
+**Phase 3 — Final dead Store sweep**
+After IR generation, walk all Stores. Any Store whose memory output has
+zero Loads from its ptr is dead and can be removed. Catches the tail of a
+chain that Phase 2 misses.
+
+**Phase 4 — `New` with initial value (design)**
+Have `New` accept an SSA value parameter for initialization instead of
+relying on zero/undef defaults. This turns Load-from-New into another
+Load-Store forwarding case. Aggregate types would need an `Aggregate`
+IR node to bundle field values
 
 ### End-to-end demo
 A tiny expression language + parser that exercises the full pipeline
@@ -35,3 +51,9 @@ tangible and catch integration bugs.
   coarse — could be narrowed with lattice meet
 - **Freelist / `kill_node`**: deferred — NodeId stability is more important
   than memory reuse at this stage
+- **Alias-class memory chains**: Replace the single `MEMORY_VAR` with
+  per-class memory SSA variables. Each `New` gets tagged with an alias class;
+  `Load`/`Store` only serialize within the same class. Independent operations
+  on different objects become fully parallel. Same approach as JVM's C2 compiler.
+  Requires: dynamic alias class allocation, per-class SSA chain, mapping from
+  `New` → alias class, per-class memory Phis at control merges.

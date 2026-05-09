@@ -917,7 +917,19 @@ impl IRBuilder {
     /// `loaded_type` is the type of the loaded value.
     /// Returns a Node whose type is `loaded_type`.
     /// Load is "amphibious" — it doesn't produce a new memory state, just reads.
+    ///
+    /// On-the-fly peephole — Load-Store forwarding:
+    /// If `mem` is a `Store` to the same `ptr`, return the Store's value directly
+    /// instead of creating a Load node.
     pub fn create_load(&mut self, mem: NodeId, ptr: NodeId, loaded_type: Type) -> NodeId {
+        // Peephole: Load-Store forwarding
+        // Load(mem, ptr) where mem is Store(_, _, ptr, value) → value
+        let mem_node = &self.nodes[mem.as_usize()];
+        if mem_node.kind == NodeKind::Store && mem_node.get_input(2) == ptr {
+            // The memory input is a Store to the same ptr — return the stored value
+            return mem_node.get_input(3);
+        }
+
         let control = self.current_control;
         let mut node = Node::new(NodeKind::Load, loaded_type);
         node.set_inputs(&[control, mem, ptr]);
@@ -2027,20 +2039,17 @@ mod tests {
         let val_id = builder.push_node(&val);
         let store_id = builder.create_store(store_mem, ptr, val_id);
 
-        // Now load: uses Store's memory state
+        // Now load: uses Store's memory state — Load-Store forwarding returns val_id directly
         let load_mem = builder.get_current_memory(); // should be Store
-        let load_id = builder.create_load(load_mem, ptr, Type::I32);
+        let load_result = builder.create_load(load_mem, ptr, Type::I32);
+        assert_eq!(load_result, val_id, "Load should forward to stored value");
 
-        // Verify the chain edges
-        // New: input[1] = Memory root
+        // Verify the chain edges (Memory -> New -> Store)
         assert_eq!(builder.nodes[ptr.as_usize()].get_input(1), mem_root);
-        // Store: input[1] = New
         assert_eq!(builder.nodes[store_id.as_usize()].get_input(1), store_mem);
         assert_eq!(builder.nodes[store_id.as_usize()].get_input(3), val_id);
-        // Load: input[1] = Store
-        assert_eq!(builder.nodes[load_id.as_usize()].get_input(1), load_mem);
 
-        // Memory chain: 2 (Memory) -> ptr (New) -> store_id (Store) -> load uses store
+        // Memory chain: 2 (Memory) -> ptr (New) -> store_id (Store)
         assert_eq!(mem_root, NodeId(2));
         assert_eq!(store_mem, ptr);
         assert_eq!(load_mem, store_id);
@@ -2171,8 +2180,8 @@ mod tests {
 
     #[test]
     fn test_memory_load_after_store_reads_same() {
-        // In Sea of Nodes, the memory chain naturally orders operations.
-        // A Load that uses Store as its memory input reads the value after the store.
+        // In Sea of Nodes, Load-Store forwarding means a Load immediately after
+        // a Store to the same ptr returns the stored value directly (no Load node).
         let mut builder = IRBuilder::new();
 
         let mem = builder.get_current_memory();
@@ -2185,12 +2194,9 @@ mod tests {
         let store_before = builder.get_current_memory();
         let store_mem = builder.create_store(store_before, ptr, val_id);
 
-        // Load from same ptr, using Store as memory — this reads AFTER the store
-        let _load_id = builder.create_load(store_mem, ptr, Type::I32);
-
-        // The chain: Memory -> New -> Store -> Load
-        // Load's memory edge is Store, guaranteeing it executes after the store
-        assert_eq!(builder.nodes[_load_id.as_usize()].get_input(1), store_mem);
+        // Load from same ptr, using Store as memory — forwarded to stored value
+        let load_result = builder.create_load(store_mem, ptr, Type::I32);
+        assert_eq!(load_result, val_id, "Load should be forwarded to the stored value");
     }
 
     #[test]
@@ -2222,6 +2228,179 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_load_store_forwarding() {
+        // Load immediately after Store to same ptr → return stored value directly
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        let ptr = builder.create_new(mem, obj_type);
+        let store_before = builder.get_current_memory();
+        let val = Node::const_int(42);
+        let val_id = builder.push_node(&val);
+        let store = builder.create_store(store_before, ptr, val_id);
+
+        // Load from same ptr using Store as memory → should forward to val_id
+        let load_result = builder.create_load(store, ptr, Type::I32);
+        assert_eq!(load_result, val_id, "Load should forward to Store's value");
+    }
+
+    #[test]
+    fn test_memory_load_without_store_creates_node() {
+        // Load from New without any prior Store → should create a Load node
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        let ptr = builder.create_new(mem, obj_type);
+        let new_mem = builder.get_current_memory(); // the New node
+
+        let load_id = builder.create_load(new_mem, ptr, Type::I32);
+        assert_ne!(load_id, NodeId(0));
+        let load_node = builder.lookup_node(load_id);
+        assert_eq!(load_node.kind, NodeKind::Load);
+    }
+
+    #[test]
+    fn test_memory_load_store_diff_ptr_no_forward() {
+        // Store to ptr1, Load from ptr2 → should NOT forward
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj1_type = Type::make_record(vec![("x", Type::I32)]);
+        let obj2_type = Type::make_record(vec![("x", Type::I32)]);
+
+        let ptr1 = builder.create_new(mem, obj1_type);
+        let mem_after_new1 = builder.get_current_memory();
+        let ptr2 = builder.create_new(mem_after_new1, obj2_type);
+
+        // Store to ptr1
+        let val = Node::const_int(7);
+        let val_id = builder.push_node(&val);
+        let store_before = builder.get_current_memory();
+        let store = builder.create_store(store_before, ptr1, val_id);
+
+        // Load from ptr2 (different ptr) — should NOT forward
+        let mem_after_store = builder.get_current_memory();
+        let load_id = builder.create_load(mem_after_store, ptr2, Type::I32);
+        let load_node = builder.lookup_node(load_id);
+        assert_eq!(
+            load_node.kind,
+            NodeKind::Load,
+            "Load from different ptr should create a Load node"
+        );
+    }
+
+    #[test]
+    fn test_memory_load_forward_from_last_store() {
+        // Two Stores to the same ptr, then Load → should forward from last Store
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        let ptr = builder.create_new(mem, obj_type);
+        let mem_after_new = builder.get_current_memory();
+
+        // First store: x = 7
+        let val1 = Node::const_int(7);
+        let val1_id = builder.push_node(&val1);
+        let store1 = builder.create_store(mem_after_new, ptr, val1_id);
+
+        // Second store: x = 99 (overwrites)
+        let val2 = Node::const_int(99);
+        let val2_id = builder.push_node(&val2);
+        let store2 = builder.create_store(store1, ptr, val2_id);
+
+        // Load — should forward to 99 (the last store's value)
+        let load_result = builder.create_load(store2, ptr, Type::I32);
+        assert_eq!(
+            load_result, val2_id,
+            "Load should forward to the most recent Store's value"
+        );
+    }
+
+    #[test]
+    fn test_memory_load_store_via_phi_no_forward() {
+        // When memory reaches Load through a Phi, we can't forward
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        // Entry -> If -> Then/Else -> Region
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then: allocate and store 10
+        builder.set_control(then_ctrl);
+        let ptr = builder.create_new(mem, obj_type.clone());
+        let then_mem_after_new = builder.get_current_memory();
+        let val = Node::const_int(10);
+        let val_id = builder.push_node(&val);
+        let then_store = builder.create_store(then_mem_after_new, ptr, val_id);
+
+        // Else: just allocate (no store), different ptr
+        builder.set_control(else_ctrl);
+        let _ptr_else = builder.create_new(mem, obj_type);
+        let else_mem = builder.get_current_memory();
+
+        // Merge at Region — memory Phi merges Store and New
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+        let merged_mem = builder.get_current_memory();
+
+        // Load from ptr using merged memory (a Phi) — should NOT forward
+        let load_id = builder.create_load(merged_mem, ptr, Type::I32);
+        let load_node = builder.lookup_node(load_id);
+        assert_eq!(
+            load_node.kind,
+            NodeKind::Load,
+            "Load via memory Phi should create a Load node"
+        );
+    }
+
+    #[test]
+    fn test_memory_load_store_skips_output_edges() {
+        // When Load-Store forwarding fires, no extra output edges should appear
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        let ptr = builder.create_new(mem, obj_type);
+        let store_before = builder.get_current_memory();
+        let val = Node::const_int(42);
+        let val_id = builder.push_node(&val);
+        let store = builder.create_store(store_before, ptr, val_id);
+
+        // Track outputs of Store and value before Load
+        let store_outputs_before = builder.node_outputs[store.as_usize()].len();
+        let val_outputs_before = builder.node_outputs[val_id.as_usize()].len();
+
+        // Load that gets forwarded — should not add output edges
+        let _load_result = builder.create_load(store, ptr, Type::I32);
+
+        // Store's outputs should not have changed (no Load node created)
+        assert_eq!(
+            builder.node_outputs[store.as_usize()].len(),
+            store_outputs_before,
+            "Store should not gain output edges from forwarded Load"
+        );
+
+        // Value's outputs should also not have changed
+        assert_eq!(
+            builder.node_outputs[val_id.as_usize()].len(),
+            val_outputs_before,
+            "Value should not gain output edges from forwarded Load"
+        );
+    }
+
+    #[test]
     fn test_memory_output_tracking() {
         // Verify that memory operations properly track output edges
         let mut builder = IRBuilder::new();
@@ -2237,20 +2416,24 @@ mod tests {
             .iter()
             .any(|id| id == ptr.0));
 
-        // Store should have New as a user (since Store's mem input = New)
+        // Allocate a second object BEFORE the store so we can use the store's
+        // memory with a different pointer (no forwarding).
+        let obj2_type = Type::make_tuple(vec![Type::I32]);
+        let current_mem = builder.get_current_memory();
+        let ptr2 = builder.create_new(current_mem, obj2_type);
+        // Now current memory is the 2nd New (ptr2). The store will write to ptr.
+        let store_mem = builder.get_current_memory(); // 2nd New
         let val = Node::const_int(7);
         let val_id = builder.push_node(&val);
-        let store_mem_before = builder.get_current_memory();
-        let store = builder.create_store(store_mem_before, ptr, val_id);
+        let store = builder.create_store(store_mem, ptr, val_id);
 
-        // New should have Store as a user
+        // New (ptr) should have Store as a user (ptr is the first New)
         assert!(builder.node_outputs[ptr.as_usize()]
             .iter()
             .any(|id| id == store.0));
 
-        // Load should have Store as a user
-        let load_mem = builder.get_current_memory();
-        let load = builder.create_load(load_mem, ptr, Type::I32);
+        // Load from ptr2 (not ptr) using Store's memory — different ptrs, no forwarding.
+        let load = builder.create_load(store, ptr2, Type::I32);
         assert!(builder.node_outputs[store.as_usize()]
             .iter()
             .any(|id| id == load.0));
