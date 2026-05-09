@@ -5,6 +5,15 @@ optimization. The system avoids creating IR nodes whenever possible — peephole
 constant folding, and value numbering happen during construction, not as
 separate passes.
 
+## Workflow Rules
+
+- **No implementation without confirmation.** When we discuss, plan, or clarify
+  something — if I say "let's plan X", ask for clarification about Y, or we're
+  in a discussion phase — do not proceed to writing code until I explicitly
+  say to go ahead (e.g., "implement it", "let's do it", "sounds good, build it").
+  Discussion and planning are separate from implementation.
+- **When you do implement**, commit the changes when done unless I say otherwise.
+
 ## What We Value
 
 - **Compact representations, cache efficiency**: Avoid pointer chasing.
