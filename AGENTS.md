@@ -12,7 +12,7 @@ separate passes.
   in a discussion phase — do not proceed to writing code until I explicitly
   say to go ahead (e.g., "implement it", "let's do it", "sounds good, build it").
   Discussion and planning are separate from implementation.
-- **When you do implement**, commit the changes when done unless I say otherwise.
+- **Always commit after implementing.** Once you finish writing code (and tests pass), commit immediately unless I explicitly tell you not to. Do not move on to another task or wait to be reminded — committing is part of finishing the implementation.
 
 ## What We Value
 
