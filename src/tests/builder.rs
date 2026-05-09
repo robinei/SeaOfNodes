@@ -1468,3 +1468,100 @@ fn test_memory_output_tracking() {
         .iter()
         .any(|id| id == load.0));
 }
+
+// ── Worklist / Idealization Tests ──
+
+#[test]
+fn test_worklist_reidealizes_on_input_change() {
+    let mut builder = IRBuilder::new();
+
+    let x = builder.create_param(0, Type::I32);
+    let c = Node::const_int(5);
+    let _zero = Node::const_int(0);
+    let c_id = builder.push_node(&c);
+    let x_id = x.get_identity_id().unwrap();
+
+    // Create Sub(x, 5) → should stay as Sub (not simplified further)
+    let sub = builder.create_sub(&x, &c).unwrap();
+    let sub_id = builder.get_node_id(&sub);
+    assert_eq!(builder.lookup_node(sub_id).kind, NodeKind::Sub);
+
+    // Replace const 5 with x → Sub(x, x) should re-idealize to 0
+    builder.replace_all_uses(c_id, x_id);
+    assert!(builder.has_work(), "replace_all_uses should enqueue users");
+    assert!(builder.worklist().contains(&sub_id), "sub_id should be on worklist");
+
+    // Process the worklist
+    builder.process_worklist();
+    assert!(!builder.has_work(), "worklist should be empty after processing");
+
+    // sub_id's users should now point to const 0
+    // Verify by checking that sub_id has no outputs (all uses were redirected)
+    assert_eq!(builder.node_outputs()[sub_id.as_usize()].len(), 0);
+}
+
+#[test]
+fn test_worklist_chain_reidealizes() {
+    // Two levels: Mul(Add(Sub(x, 5), y), 10) — change 5 to x to trigger cascading
+    // idealization: Sub(x,x)→0, Add(0,y)→y, Mul(y,10) — no change since y is not 0 or 1
+    let mut builder = IRBuilder::new();
+
+    let x = builder.create_param(0, Type::I32);
+    let y = builder.create_param(1, Type::I32);
+    let c = Node::const_int(5);
+    let ten = Node::const_int(10);
+    let c_id = builder.push_node(&c);
+    let ten_id = builder.push_node(&ten);
+    let x_id = x.get_identity_id().unwrap();
+    let _y_id = y.get_identity_id().unwrap();
+
+    // Sub(x, 5) — no further simplification
+    let sub = builder.create_sub(&x, &c).unwrap();
+    let sub_id = builder.get_node_id(&sub);
+    assert_eq!(builder.lookup_node(sub_id).kind, NodeKind::Sub);
+
+    // Add(Sub, y) — neither operand simplifies
+    let add = builder.create_add(&sub, &y).unwrap();
+    let add_id = builder.get_node_id(&add);
+    assert_eq!(builder.lookup_node(add_id).kind, NodeKind::Add);
+
+    // Mul(Add, 10) — a consumer of add
+    let mul = builder.create_mul(&add, &ten).unwrap();
+    let mul_id = builder.get_node_id(&mul);
+    assert_eq!(builder.lookup_node(mul_id).kind, NodeKind::Mul);
+
+    // add has mul as a user
+    assert!(builder.node_outputs()[add_id.as_usize()]
+        .iter()
+        .any(|id| id == mul_id.0));
+
+    // ten has mul as a user
+    let ten_had_mul = builder.node_outputs()[ten_id.as_usize()]
+        .iter()
+        .any(|id| id == mul_id.0);
+    assert!(ten_had_mul);
+
+    // Replace const 5 with x → Sub(x, x) → 0; then Add(0, y) → y
+    builder.replace_all_uses(c_id, x_id);
+    assert!(builder.has_work());
+    assert!(builder.worklist().contains(&sub_id));
+    assert!(!builder.worklist().contains(&add_id));
+
+    // Process — should cascade through sub and add
+    builder.process_worklist();
+    assert!(!builder.has_work());
+
+    // sub and add are dead (all uses redirected)
+    assert_eq!(builder.node_outputs()[sub_id.as_usize()].len(), 0);
+    assert_eq!(builder.node_outputs()[add_id.as_usize()].len(), 0);
+
+    // The cascade happened without errors.
+    // mul was re-idealized: Mul(y, 10) — the interning lookup creates a new
+    // Mul (since interned_nodes hash has the old inputs with add_id).
+    // The old mul_id is dead; ten now has the new Mul as a user.
+    assert_ne!(builder.lookup_node(mul_id).get_input(1), add_id,
+        "mul's first input should no longer be add_id");
+
+    // ten has at least one user (the new Mul replacing the old one)
+    assert!(builder.node_outputs()[ten_id.as_usize()].len() > 0);
+}

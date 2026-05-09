@@ -267,6 +267,12 @@ impl std::hash::Hash for Node {
         for i in 0..self.inputs_len() {
             self.get_input(i).hash(state);
         }
+        // Hash discriminant-specific union data
+        match self.kind {
+            NodeKind::Param => unsafe { self.data.param_index.hash(state) },
+            NodeKind::Identity => unsafe { self.data.identity_id.hash(state) },
+            _ => {}
+        }
     }
 }
 
@@ -288,7 +294,12 @@ impl PartialEq for Node {
                 return false;
             }
         }
-        true
+        // Compare discriminant-specific union data
+        match self.kind {
+            NodeKind::Param => unsafe { self.data.param_index == other.data.param_index },
+            NodeKind::Identity => unsafe { self.data.identity_id == other.data.identity_id },
+            _ => true,
+        }
     }
 }
 

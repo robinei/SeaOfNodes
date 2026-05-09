@@ -28,6 +28,7 @@ pub struct IRBuilder {
     variables: Vec<VariableState>,
     sealed: HashSet<NodeId>,
     incomplete_phis: HashMap<(VarId, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
+    worklist: Vec<NodeId>,
 }
 
 // ── Test-only accessors ──
@@ -44,6 +45,10 @@ impl IRBuilder {
 
     pub(crate) fn incomplete_phis(&self) -> &HashMap<(VarId, NodeId), NodeId> {
         &self.incomplete_phis
+    }
+
+    pub(crate) fn worklist(&self) -> &[NodeId] {
+        &self.worklist
     }
 }
 
@@ -67,6 +72,7 @@ impl IRBuilder {
             }],
             sealed: HashSet::new(),
             incomplete_phis: HashMap::new(),
+            worklist: Vec::new(),
         };
         builder.sealed.insert(NodeId(1)); // Entry is sealed from the start
         // At Entry, the reaching memory is the Memory root node (node 2)
@@ -143,22 +149,32 @@ impl IRBuilder {
         }
 
         // Snapshot old outputs, then clear the old node's output list
+        // Also check which users are pure before loop (avoids borrow conflicts)
         let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()]
             .iter()
             .map(|x| NodeId(x))
             .collect();
+        let pure_users: Vec<bool> = old_outputs
+            .iter()
+            .map(|&id| self.nodes[id.as_usize()].kind.is_pure())
+            .collect();
         self.node_outputs[old_id.as_usize()].set_all(&[]);
 
         // Rewire each old user to point to new_id instead of old_id
-        for &user_id in &old_outputs {
+        for (i, &user_id) in old_outputs.iter().enumerate() {
             let user = &mut self.nodes[user_id.as_usize()];
-            for i in 0..user.inputs_len() {
-                if user.get_input(i) == old_id {
-                    user.set_input(i, new_id);
+            for j in 0..user.inputs_len() {
+                if user.get_input(j) == old_id {
+                    user.set_input(j, new_id);
                     break;
                 }
             }
             self.node_outputs[new_id.as_usize()].push(user_id.0);
+
+            // Schedule re-idealization for pure users whose input changed
+            if pure_users[i] {
+                self.worklist.push(user_id);
+            }
         }
     }
 
@@ -645,5 +661,104 @@ impl IRBuilder {
             .current_def
             .insert(control, id);
         id
+    }
+
+    // ── Worklist / Idealization ──
+
+    /// Wrap a node ID in an Identity facade when needed for the creator API.
+    /// Builders expect &Node references (Potentially Identity-wrapped for Param-like nodes).
+    /// When reading a node from the arena that is non-pure and non-Identity,
+    /// wrap it in an Identity so that the creator's resolve_if_identity_node works correctly
+    /// and the creator's fallback get_node_id call doesn't panic.
+    fn wrap_for_creator(&self, id: NodeId) -> Node {
+        let node = self.lookup_node(id);
+        if node.kind.is_pure() || node.kind == NodeKind::Identity {
+            node.clone()
+        } else {
+            let mut identity = Node::new(NodeKind::Identity, node.t.clone());
+            identity.data.identity_id = id;
+            identity
+        }
+    }
+
+    /// Re-idealize a single node slot by re-running its creator with current inputs.
+    /// Returns `Some(new_id)` if the node was simplified to a different existing node,
+    /// or `None` if it's already ideal.
+    fn idealize(&mut self, slot: NodeId) -> Option<NodeId> {
+        // Snapshot kind and inputs to avoid borrow conflicts with self.create_* calls
+        let (kind, inputs): (NodeKind, Vec<NodeId>) = {
+            let node = &self.nodes[slot.as_usize()];
+            let inputs = (0..node.inputs_len())
+                .map(|i| node.get_input(i))
+                .collect();
+            (node.kind, inputs)
+        };
+
+        let result = match kind {
+            NodeKind::Add => {
+                let lhs = self.wrap_for_creator(inputs[1]);
+                let rhs = self.wrap_for_creator(inputs[2]);
+                self.create_add(&lhs, &rhs).ok()
+            }
+            NodeKind::Sub => {
+                let lhs = self.wrap_for_creator(inputs[1]);
+                let rhs = self.wrap_for_creator(inputs[2]);
+                self.create_sub(&lhs, &rhs).ok()
+            }
+            NodeKind::Mul => {
+                let lhs = self.wrap_for_creator(inputs[1]);
+                let rhs = self.wrap_for_creator(inputs[2]);
+                self.create_mul(&lhs, &rhs).ok()
+            }
+            NodeKind::Div => {
+                let lhs = self.wrap_for_creator(inputs[1]);
+                let rhs = self.wrap_for_creator(inputs[2]);
+                self.create_div(&lhs, &rhs).ok()
+            }
+            _ => None,
+        };
+
+        match result {
+            Some(node) => {
+                let new_id = match node.get_identity_id() {
+                    Some(id) => id,
+                    None if node.kind.is_pure() => self.push_node(&node),
+                    None => {
+                        // Non-pure, non-Identity result: creator short-circuited to one of
+                        // its operands (e.g. 0 + y → y where y is a raw Param).
+                        // Find the matching input ID by comparing nodes.
+                        let found = inputs.iter().copied().find(|&id| {
+                            id.is_valid() && *self.lookup_node(id) == node
+                        });
+                        match found {
+                            Some(id) => id,
+                            None => return None,
+                        }
+                    }
+                };
+                if new_id != slot {
+                    Some(new_id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Drain the worklist, re-idealizing any nodes whose inputs changed.
+    /// This ensures cascading optimizations propagate (e.g., a Phi collapse
+    /// triggers re-evaluation of its pure-node users).
+    pub fn process_worklist(&mut self) {
+        while let Some(slot) = self.worklist.pop() {
+            if let Some(new_id) = self.idealize(slot) {
+                self.replace_all_uses(slot, new_id);
+            }
+        }
+    }
+
+    /// Returns true if there are pending work items to process.
+    pub fn has_work(&self) -> bool {
+        !self.worklist.is_empty()
     }
 }
