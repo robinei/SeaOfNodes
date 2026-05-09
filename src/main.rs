@@ -9,6 +9,7 @@ use types::*;
 use crate::compact_vec::CompactVec;
 
 pub type NodeId = u32;
+pub type VarId = usize;
 
 type InputsVecData = CompactVecData<16, 8, 4>;
 type OutputsVec = CompactVec<16, 8, 4>;
@@ -260,7 +261,7 @@ pub struct IRBuilder {
     current_control: NodeId,
     variables: Vec<VariableState>,
     sealed: HashSet<NodeId>,
-    incomplete_phis: HashMap<(usize, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
+    incomplete_phis: HashMap<(VarId, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
 }
 
 impl IRBuilder {
@@ -360,7 +361,7 @@ impl IRBuilder {
     }
 
     /// Allocate a new source variable with a human-readable name.
-    pub fn create_variable(&mut self, name: &str) -> usize {
+    pub fn create_variable(&mut self, name: &str) -> VarId {
         let idx = self.variables.len();
         self.variables.push(VariableState {
             name: name.to_string(),
@@ -383,7 +384,7 @@ impl IRBuilder {
 
     /// Record that `value` is the current definition of `var` at the current control point.
     #[inline]
-    pub fn write_variable(&mut self, var: usize, value: NodeId) {
+    pub fn write_variable(&mut self, var: VarId, value: NodeId) {
         self.variables[var]
             .current_def
             .insert(self.current_control, value);
@@ -391,12 +392,12 @@ impl IRBuilder {
 
     /// Read the current value of `var` at the current control point.
     /// Inserts Phi nodes as needed (Braun-style lazy SSA construction).
-    pub fn read_variable(&mut self, var: usize) -> NodeId {
+    pub fn read_variable(&mut self, var: VarId) -> NodeId {
         self.lookup_variable(var, self.current_control)
     }
 
     /// Internal: look up a variable at a specific control point, recursing backward if needed.
-    fn lookup_variable(&mut self, var: usize, ctrl: NodeId) -> NodeId {
+    fn lookup_variable(&mut self, var: VarId, ctrl: NodeId) -> NodeId {
         // Local value numbering check
         if let Some(&val) = self.variables[var].current_def.get(&ctrl) {
             return val;
@@ -405,7 +406,7 @@ impl IRBuilder {
     }
 
     /// Braun-style backward search for a variable's reaching definition.
-    fn read_variable_recursive(&mut self, var: usize, ctrl: NodeId) -> NodeId {
+    fn read_variable_recursive(&mut self, var: VarId, ctrl: NodeId) -> NodeId {
         if !self.sealed.contains(&ctrl) {
             // Incomplete CFG: place an operandless Phi and record it as incomplete
             let phi = self.create_phi_node(ctrl, &[]);
@@ -439,7 +440,7 @@ impl IRBuilder {
 
     /// Fill operands of a newly-created Phi by recursively reading from each predecessor.
     /// Then attempt trivial Phi elimination.
-    fn add_phi_operands(&mut self, var: usize, phi_id: NodeId, ctrl: NodeId) -> NodeId {
+    fn add_phi_operands(&mut self, var: VarId, phi_id: NodeId, ctrl: NodeId) -> NodeId {
         let preds = self.get_control_predecessors(ctrl);
         let mut operand_types: Vec<Type> = Vec::new();
         for &pred in &preds {
@@ -540,7 +541,7 @@ impl IRBuilder {
         self.sealed.insert(ctrl);
 
         // Collect incomplete Phis for this block and fill their operands
-        let keys_to_fill: Vec<(usize, NodeId)> = self
+        let keys_to_fill: Vec<(VarId, NodeId)> = self
             .incomplete_phis
             .keys()
             .filter(|&&(_, c)| c == ctrl)
