@@ -366,6 +366,32 @@ impl<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize>
     }
 }
 
+pub struct CompactVecIter<'a, const M8: usize, const M16: usize, const M32: usize> {
+    vec: &'a CompactVec<M8, M16, M32>,
+    index: usize,
+}
+
+impl<'a, const M8: usize, const M16: usize, const M32: usize> Iterator
+    for CompactVecIter<'a, M8, M16, M32>
+{
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.vec.len() {
+            let val = self.vec.get(self.index);
+            self.index += 1;
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len() - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
 pub struct CompactVec<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize> {
     state: CompactVecStateU64,
     data: CompactVecData<MAX_U8, MAX_U16, MAX_U32>,
@@ -423,6 +449,11 @@ impl<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize>
     }
 
     #[inline]
+    pub fn iter(&self) -> CompactVecIter<'_, MAX_U8, MAX_U16, MAX_U32> {
+        CompactVecIter { vec: self, index: 0 }
+    }
+
+    #[inline]
     pub fn get(&self, index: usize) -> u32 {
         self.data.get(&self.state, index)
     }
@@ -440,6 +471,19 @@ impl<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize>
     #[inline]
     pub fn push(&mut self, item: u32) {
         self.data.push(&mut self.state, item)
+    }
+
+    /// Remove element at index using swap-with-last (O(1)).
+    /// Order is not preserved.
+    #[inline]
+    pub fn remove(&mut self, index: usize) {
+        assert!(index < self.state.len());
+        let last = self.state.len() - 1;
+        if index != last {
+            let last_val = self.data.get(&self.state, last);
+            self.data.set(&mut self.state, index, last_val);
+        }
+        self.state.set_len(last);
     }
 
     #[inline]

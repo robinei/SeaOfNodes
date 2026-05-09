@@ -205,6 +205,7 @@ impl std::hash::Hash for Node {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.kind.hash(state);
+        self.t.hash(state);
         self.inputs_state.hash(state);
         for i in 0..self.inputs_len() {
             self.get_input(i).hash(state);
@@ -215,7 +216,10 @@ impl std::hash::Hash for Node {
 impl PartialEq for Node {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        if self.kind != other.kind || self.inputs_state != other.inputs_state {
+        if self.kind != other.kind
+            || self.t != other.t
+            || self.inputs_state != other.inputs_state
+        {
             return false;
         }
         let len = self.inputs_len();
@@ -268,9 +272,55 @@ impl IRBuilder {
 
     #[inline]
     fn push_node(&mut self, node: &Node) -> NodeId {
+        // For pure nodes, check if already interned (avoids duplicates)
+        if node.kind.is_pure() {
+            if let Some(&id) = self.interned_nodes.get(node) {
+                return id;
+            }
+        }
+
         let id = self.nodes.len() as NodeId;
         self.nodes.push(node.clone());
+        self.node_outputs.push(OutputsVec::new());
+
+        // Build outputs mirror for all inputs
+        for i in 0..node.inputs_len() {
+            let input_id = node.get_input(i);
+            if input_id > 0 {
+                self.node_outputs[input_id as usize].push(id);
+            }
+        }
+
+        // Insert into interned_nodes if pure
+        if node.kind.is_pure() {
+            self.interned_nodes.insert(node.clone(), id);
+        }
+
         id
+    }
+
+    /// Replace an existing node entirely, keeping all outputs perfectly in sync.
+    /// All users of old_id are rewired to point to the new node.
+    pub fn replace_node(&mut self, old_id: NodeId, new_node: &Node) -> NodeId {
+        let new_id = self.push_node(new_node);
+
+        // Snapshot old outputs, then clear the old node's output list
+        let old_outputs: Vec<NodeId> = self.node_outputs[old_id as usize].iter().collect();
+        self.node_outputs[old_id as usize].set_all(&[]);
+
+        // Rewire each old user to point to new_id instead of old_id
+        for &user_id in &old_outputs {
+            let user = &mut self.nodes[user_id as usize];
+            for i in 0..user.inputs_len() {
+                if user.get_input(i) == old_id {
+                    user.set_input(i, new_id);
+                    break;
+                }
+            }
+            self.node_outputs[new_id as usize].push(user_id);
+        }
+
+        new_id
     }
 
     #[inline]
@@ -278,22 +328,14 @@ impl IRBuilder {
         if let Some(identity_id) = node.get_identity_id() {
             identity_id
         } else if node.kind.is_pure() {
-            if let Some(interned_id) = self.interned_nodes.get(&node) {
-                // already intertned!
-                *interned_id
-            } else {
-                // needs interning
-                let interned_id = self.push_node(node);
-                self.interned_nodes.insert(node.clone(), interned_id);
-                interned_id
-            }
+            self.push_node(node) // push_node handles interning
         } else {
             panic!("can't intern impure node - they need to have identity")
         }
     }
 
     #[inline]
-    fn resolve_if_identity_node<'a>(&'a self, node: &'a Node) -> &Node {
+    fn resolve_if_identity_node<'a>(&'a self, node: &'a Node) -> &'a Node {
         if let Some(identity_id) = node.get_identity_id() {
             &self.nodes[identity_id as usize]
         } else {
@@ -601,7 +643,7 @@ mod tests {
         let mut builder = IRBuilder::new();
 
         let x = builder.create_param(0, Type::I32);
-        let two = Node::const_int(2);
+        let _two = Node::const_int(2);
 
         // Test x + x => x * 2 (from create_add)
         let result = builder.create_add(&x, &x).unwrap();
@@ -838,5 +880,73 @@ mod tests {
         } else {
             panic!("Expected Union type, got {:?}", outer_union);
         }
+    }
+
+    #[test]
+    fn test_outputs_tracking() {
+        let mut builder = IRBuilder::new();
+
+        // Create param (node 2) and const (node 3)
+        let x = builder.create_param(0, Type::I32);
+        let c = Node::const_int(5);
+        let c_id = builder.push_node(&c);
+
+        // Add: node 4 = x + c (inputs: 0, x_id, c_id)
+        let add_result = builder.create_add(&x, &c).unwrap();
+        let add_id = builder.get_node_id(&add_result);
+
+        // Verify outputs: x should have add_id as user, c should have add_id as user
+        let x_id = x.get_identity_id().unwrap() as usize;
+        let x_outputs = &builder.node_outputs[x_id];
+        assert!(x_outputs.iter().any(|id| id == add_id));
+
+        let c_outputs = &builder.node_outputs[c_id as usize];
+        assert!(c_outputs.iter().any(|id| id == add_id));
+
+        // Create sub: node 5 = add - c
+        let sub_result = builder.create_sub(&add_result, &c).unwrap();
+        let sub_id = builder.get_node_id(&sub_result);
+
+        // add_id should now have sub_id as a user
+        let add_outputs = &builder.node_outputs[add_id as usize];
+        assert!(add_outputs.iter().any(|id| id == sub_id));
+
+        // c should have both add_id and sub_id as users
+        let c_outputs = &builder.node_outputs[c_id as usize];
+        assert!(c_outputs.iter().any(|id| id == add_id));
+        assert!(c_outputs.iter().any(|id| id == sub_id));
+    }
+
+    #[test]
+    fn test_replace_node_outputs() {
+        let mut builder = IRBuilder::new();
+
+        let x = builder.create_param(0, Type::I32);
+        let c = Node::const_int(5);
+        let c_id = builder.push_node(&c);
+
+        // add1: x + 5
+        let add1 = builder.create_add(&x, &c).unwrap();
+        let add1_id = builder.get_node_id(&add1);
+
+        // Verify c has add1 as a user
+        assert!(builder.node_outputs[c_id as usize].iter().any(|id| id == add1_id));
+
+        // Now replace c (const 5) with const 0
+        let zero = Node::const_int(0);
+        let new_c_id = builder.replace_node(c_id, &zero);
+
+        // Old c should have no outputs left
+        assert!(builder.node_outputs[c_id as usize].is_empty());
+
+        // New zero const should have add1 as a user
+        assert!(builder.node_outputs[new_c_id as usize].iter().any(|id| id == add1_id));
+
+        // add1 now references new_c_id instead of c_id
+        let add1_inputs: Vec<_> = (0..builder.lookup_node(add1_id).inputs_len())
+            .map(|i| builder.lookup_node(add1_id).get_input(i))
+            .collect();
+        assert!(add1_inputs.contains(&new_c_id));
+        assert!(!add1_inputs.contains(&c_id));
     }
 }
