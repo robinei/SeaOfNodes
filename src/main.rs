@@ -8,8 +8,61 @@ use types::*;
 
 use crate::compact_vec::CompactVec;
 
-pub type NodeId = u32;
-pub type VarId = usize;
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct NodeId(pub u32);
+
+impl NodeId {
+    pub const UNREACHABLE: NodeId = NodeId(0);
+
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    pub fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl From<u32> for NodeId {
+    #[inline]
+    fn from(v: u32) -> Self {
+        NodeId(v)
+    }
+}
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<NodeId> for u32 {
+    #[inline]
+    fn from(id: NodeId) -> Self {
+        id.0
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct VarId(pub usize);
+
+impl VarId {
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for VarId {
+    #[inline]
+    fn from(v: usize) -> Self {
+        VarId(v)
+    }
+}
 
 type InputsVecData = CompactVecData<16, 8, 4>;
 type OutputsVec = CompactVec<16, 8, 4>;
@@ -162,27 +215,28 @@ impl Node {
 
     #[inline]
     pub fn get_input(&self, index: usize) -> NodeId {
-        unsafe { self.data.inputs.get(&self.inputs_state, index) }
+        NodeId(unsafe { self.data.inputs.get(&self.inputs_state, index) })
     }
 
     #[inline]
     pub fn set_inputs(&mut self, inputs: &[NodeId]) {
+        let raw: Vec<u32> = inputs.iter().map(|id| id.0).collect();
         unsafe {
-            self.data.inputs.set_all(&mut self.inputs_state, inputs);
+            self.data.inputs.set_all(&mut self.inputs_state, &raw);
         }
     }
 
     #[inline]
     pub fn set_input(&mut self, index: usize, input: NodeId) {
         unsafe {
-            self.data.inputs.set(&mut self.inputs_state, index, input);
+            self.data.inputs.set(&mut self.inputs_state, index, input.0);
         }
     }
 
     #[inline]
     pub fn push_input(&mut self, input: NodeId) {
         unsafe {
-            self.data.inputs.push(&mut self.inputs_state, input);
+            self.data.inputs.push(&mut self.inputs_state, input.0);
         }
     }
 
@@ -273,18 +327,18 @@ impl IRBuilder {
             ],
             node_outputs: vec![OutputsVec::new(), OutputsVec::new()],
             interned_nodes: HashMap::new(),
-            current_control: 1, // Entry
+            current_control: NodeId(1), // Entry
             variables: Vec::new(),
             sealed: HashSet::new(),
             incomplete_phis: HashMap::new(),
         };
-        builder.sealed.insert(1); // Entry is sealed from the start
+        builder.sealed.insert(NodeId(1)); // Entry is sealed from the start
         builder
     }
 
     #[inline]
     fn lookup_node(&self, id: NodeId) -> &Node {
-        &self.nodes[id as usize]
+        &self.nodes[id.as_usize()]
     }
 
     #[inline]
@@ -296,15 +350,15 @@ impl IRBuilder {
             }
         }
 
-        let id = self.nodes.len() as NodeId;
+        let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node.clone());
         self.node_outputs.push(OutputsVec::new());
 
         // Build outputs mirror for all inputs
         for i in 0..node.inputs_len() {
             let input_id = node.get_input(i);
-            if input_id > 0 {
-                self.node_outputs[input_id as usize].push(id);
+            if input_id.is_valid() {
+                self.node_outputs[input_id.as_usize()].push(id.0);
             }
         }
 
@@ -322,19 +376,19 @@ impl IRBuilder {
         let new_id = self.push_node(new_node);
 
         // Snapshot old outputs, then clear the old node's output list
-        let old_outputs: Vec<NodeId> = self.node_outputs[old_id as usize].iter().collect();
-        self.node_outputs[old_id as usize].set_all(&[]);
+        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()].iter().map(|x| NodeId(x)).collect();
+        self.node_outputs[old_id.as_usize()].set_all(&[]);
 
         // Rewire each old user to point to new_id instead of old_id
         for &user_id in &old_outputs {
-            let user = &mut self.nodes[user_id as usize];
+            let user = &mut self.nodes[user_id.as_usize()];
             for i in 0..user.inputs_len() {
                 if user.get_input(i) == old_id {
                     user.set_input(i, new_id);
                     break;
                 }
             }
-            self.node_outputs[new_id as usize].push(user_id);
+            self.node_outputs[new_id.as_usize()].push(user_id.0);
         }
 
         new_id
@@ -346,17 +400,17 @@ impl IRBuilder {
         if old_id == new_id {
             return;
         }
-        let old_outputs: Vec<NodeId> = self.node_outputs[old_id as usize].iter().collect();
-        self.node_outputs[old_id as usize].set_all(&[]);
+        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()].iter().map(|x| NodeId(x)).collect();
+        self.node_outputs[old_id.as_usize()].set_all(&[]);
         for &user_id in &old_outputs {
-            let user = &mut self.nodes[user_id as usize];
+            let user = &mut self.nodes[user_id.as_usize()];
             for i in 0..user.inputs_len() {
                 if user.get_input(i) == old_id {
                     user.set_input(i, new_id);
                     break;
                 }
             }
-            self.node_outputs[new_id as usize].push(user_id);
+            self.node_outputs[new_id.as_usize()].push(user_id.0);
         }
     }
 
@@ -367,7 +421,7 @@ impl IRBuilder {
             name: name.to_string(),
             current_def: HashMap::new(),
         });
-        idx
+        VarId(idx)
     }
 
     /// Set the current control (program point) for subsequent reads/writes.
@@ -385,7 +439,7 @@ impl IRBuilder {
     /// Record that `value` is the current definition of `var` at the current control point.
     #[inline]
     pub fn write_variable(&mut self, var: VarId, value: NodeId) {
-        self.variables[var]
+        self.variables[var.as_usize()]
             .current_def
             .insert(self.current_control, value);
     }
@@ -399,7 +453,7 @@ impl IRBuilder {
     /// Internal: look up a variable at a specific control point, recursing backward if needed.
     fn lookup_variable(&mut self, var: VarId, ctrl: NodeId) -> NodeId {
         // Local value numbering check
-        if let Some(&val) = self.variables[var].current_def.get(&ctrl) {
+        if let Some(&val) = self.variables[var.as_usize()].current_def.get(&ctrl) {
             return val;
         }
         self.read_variable_recursive(var, ctrl)
@@ -412,29 +466,29 @@ impl IRBuilder {
             let phi = self.create_phi_node(ctrl, &[]);
             let phi_id = self.push_node(&phi);
             self.incomplete_phis.insert((var, ctrl), phi_id);
-            self.variables[var].current_def.insert(ctrl, phi_id);
+            self.variables[var.as_usize()].current_def.insert(ctrl, phi_id);
             return phi_id;
         }
 
         let preds = self.get_control_predecessors(ctrl);
         if preds.is_empty() {
             // No predecessors (e.g., Entry): variable is undefined → NodeId 0 (Unreachable)
-            self.variables[var].current_def.insert(ctrl, 0);
-            return 0;
+            self.variables[var.as_usize()].current_def.insert(ctrl, NodeId(0));
+            return NodeId(0);
         }
         if preds.len() == 1 {
             // Single predecessor: just recurse, no Phi needed
             let val = self.lookup_variable(var, preds[0]);
-            self.variables[var].current_def.insert(ctrl, val);
+            self.variables[var.as_usize()].current_def.insert(ctrl, val);
             return val;
         }
 
         // Multiple predecessors: place operandless Phi to break cycles, then fill operands
         let phi = self.create_phi_node(ctrl, &[]);
         let phi_id = self.push_node(&phi);
-        self.variables[var].current_def.insert(ctrl, phi_id);
+        self.variables[var.as_usize()].current_def.insert(ctrl, phi_id);
         let val = self.add_phi_operands(var, phi_id, ctrl);
-        self.variables[var].current_def.insert(ctrl, val);
+        self.variables[var.as_usize()].current_def.insert(ctrl, val);
         val
     }
 
@@ -446,19 +500,19 @@ impl IRBuilder {
         for &pred in &preds {
             let val = self.lookup_variable(var, pred);
             // Append operand to Phi
-            self.nodes[phi_id as usize].push_input(val);
+            self.nodes[phi_id.as_usize()].push_input(val);
             // Register phi_id as a user of val
-            self.node_outputs[val as usize].push(phi_id);
+            self.node_outputs[val.as_usize()].push(phi_id.0);
             // Collect operand type for refining Phi's type
-            operand_types.push(self.nodes[val as usize].t.clone());
+            operand_types.push(self.nodes[val.as_usize()].t.clone());
         }
         // Refine Phi's type: join of all operand types
         if operand_types.is_empty() {
-            self.nodes[phi_id as usize].t = Type::Never;
+            self.nodes[phi_id.as_usize()].t = Type::Never;
         } else if operand_types.iter().all(|t| *t == operand_types[0]) {
-            self.nodes[phi_id as usize].t = operand_types[0].clone();
+            self.nodes[phi_id.as_usize()].t = operand_types[0].clone();
         } else {
-            self.nodes[phi_id as usize].t = Type::make_union(operand_types);
+            self.nodes[phi_id.as_usize()].t = Type::make_union(operand_types);
         }
         self.try_remove_trivial_phi(phi_id)
     }
@@ -467,7 +521,7 @@ impl IRBuilder {
     /// A Phi is trivial if it merges the same value (possibly with self-references).
     fn try_remove_trivial_phi(&mut self, phi_id: NodeId) -> NodeId {
         let mut same: Option<NodeId> = None;
-        let phi = &self.nodes[phi_id as usize];
+        let phi = &self.nodes[phi_id.as_usize()];
 
         // Skip input[0] (the control region); only consider value operands
         for i in 1..phi.inputs_len() {
@@ -483,11 +537,11 @@ impl IRBuilder {
 
         let replacement = match same {
             Some(v) => v,
-            None => 0, // Phi references only itself (unreachable) → undef = node 0 (Unreachable)
+            None => NodeId(0), // Phi references only itself (unreachable) → undef = node 0 (Unreachable)
         };
 
         // Snapshot phi's users before rerouting
-        let phi_users: Vec<NodeId> = self.node_outputs[phi_id as usize].iter().collect();
+        let phi_users: Vec<NodeId> = self.node_outputs[phi_id.as_usize()].iter().map(|x| NodeId(x)).collect();
 
         // Reroute all uses of phi to replacement
         self.replace_all_uses(phi_id, replacement);
@@ -495,7 +549,7 @@ impl IRBuilder {
         // Recursively check Phi users that might have become trivial
         for &user_id in &phi_users {
             if user_id != phi_id {
-                let kind = self.nodes[user_id as usize].kind;
+                let kind = self.nodes[user_id.as_usize()].kind;
                 if kind == NodeKind::Phi {
                     self.try_remove_trivial_phi(user_id);
                 }
@@ -507,17 +561,17 @@ impl IRBuilder {
 
     /// Get the control predecessors of a control node.
     fn get_control_predecessors(&self, ctrl: NodeId) -> Vec<NodeId> {
-        match self.nodes[ctrl as usize].kind {
+        match self.nodes[ctrl.as_usize()].kind {
             NodeKind::Region | NodeKind::Loop => {
                 // All inputs are control predecessors
-                let n = self.nodes[ctrl as usize].inputs_len();
-                (0..n).map(|i| self.nodes[ctrl as usize].get_input(i)).collect()
+                let n = self.nodes[ctrl.as_usize()].inputs_len();
+                (0..n).map(|i| self.nodes[ctrl.as_usize()].get_input(i)).collect()
             }
             NodeKind::Entry => vec![],
             _ => {
                 // For non-merge control nodes, the single control input at index 0
-                if self.nodes[ctrl as usize].inputs_len() > 0 {
-                    vec![self.nodes[ctrl as usize].get_input(0)]
+                if self.nodes[ctrl.as_usize()].inputs_len() > 0 {
+                    vec![self.nodes[ctrl.as_usize()].get_input(0)]
                 } else {
                     vec![]
                 }
@@ -528,11 +582,11 @@ impl IRBuilder {
     /// Add a new predecessor to a Loop node (for back-edges).
     /// The loop is not sealed yet, so no Phi filling is triggered.
     pub fn push_loop_back_edge(&mut self, loop_ctrl: NodeId, back_edge: NodeId) {
-        self.nodes[loop_ctrl as usize].push_input(back_edge);
+        self.nodes[loop_ctrl.as_usize()].push_input(back_edge);
         // Register the back-edge as a user of loop_ctrl's outputs...
         // Actually, back_edge is an input to the loop node, so loop_ctrl
         // becomes an output of back_edge.
-        self.node_outputs[back_edge as usize].push(loop_ctrl);
+        self.node_outputs[back_edge.as_usize()].push(loop_ctrl.0);
     }
 
     /// Seal a control node — no more predecessors will be added.
@@ -552,7 +606,7 @@ impl IRBuilder {
             let phi_id = self.incomplete_phis.remove(&key).unwrap();
             let (var, _) = key;
             let result = self.add_phi_operands(var, phi_id, ctrl);
-            self.variables[var].current_def.insert(ctrl, result);
+            self.variables[var.as_usize()].current_def.insert(ctrl, result);
         }
     }
 
@@ -580,7 +634,7 @@ impl IRBuilder {
     #[inline]
     fn resolve_if_identity_node<'a>(&'a self, node: &'a Node) -> &'a Node {
         if let Some(identity_id) = node.get_identity_id() {
-            &self.nodes[identity_id as usize]
+            &self.nodes[identity_id.as_usize()]
         } else {
             node
         }
@@ -619,7 +673,7 @@ impl IRBuilder {
             self.create_add(&xy, &z)?
         } else {
             let mut node = Node::new(NodeKind::Add, t);
-            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]);
+            node.set_inputs(&[NodeId(0), self.get_node_id(lhs), self.get_node_id(rhs)]);
             node
         })
     }
@@ -651,7 +705,7 @@ impl IRBuilder {
             self.create_sub(&xz, &y)?
         } else {
             let mut node = Node::new(NodeKind::Sub, t);
-            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[NodeId(0), self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
@@ -677,14 +731,14 @@ impl IRBuilder {
         } else if l == r {
             // x * x => x^2 (no special peephole for now)
             let mut node = Node::new(NodeKind::Mul, t);
-            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]);
+            node.set_inputs(&[NodeId(0), self.get_node_id(lhs), self.get_node_id(rhs)]);
             node
         } else if l.kind != NodeKind::Mul && r.kind == NodeKind::Mul {
             // non-mul * mul => mul * non-mul (canonicalize)
             self.create_mul(rhs, lhs)?
         } else {
             let mut node = Node::new(NodeKind::Mul, t);
-            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[NodeId(0), self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
@@ -709,7 +763,7 @@ impl IRBuilder {
             Node::num_of_type(1, &t)
         } else {
             let mut node = Node::new(NodeKind::Div, t);
-            node.set_inputs(&[0, self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
+            node.set_inputs(&[NodeId(0), self.get_node_id(lhs), self.get_node_id(rhs)]); // 0 = no control dependency
             node
         })
     }
@@ -773,7 +827,7 @@ impl IRBuilder {
                 } else {
                     // Safe cast, create StaticCast node
                     let mut node = Node::new(NodeKind::StaticCast, target_type);
-                    node.set_inputs(&[0, self.get_node_id(value)]);
+                    node.set_inputs(&[NodeId(0), self.get_node_id(value)]);
                     Ok(node)
                 }
             }
@@ -781,7 +835,7 @@ impl IRBuilder {
             CastKind::Dynamic => {
                 // Runtime check required, create DynamicCast node
                 let mut node = Node::new(NodeKind::DynamicCast, target_type);
-                node.set_inputs(&[0, self.get_node_id(value)]);
+                node.set_inputs(&[NodeId(0), self.get_node_id(value)]);
                 Ok(node)
             }
 
@@ -1147,25 +1201,25 @@ mod tests {
         let add_id = builder.get_node_id(&add_result);
 
         // Verify outputs: x should have add_id as user, c should have add_id as user
-        let x_id = x.get_identity_id().unwrap() as usize;
+        let x_id = x.get_identity_id().unwrap().as_usize();
         let x_outputs = &builder.node_outputs[x_id];
-        assert!(x_outputs.iter().any(|id| id == add_id));
+        assert!(x_outputs.iter().any(|id| id == add_id.0));
 
-        let c_outputs = &builder.node_outputs[c_id as usize];
-        assert!(c_outputs.iter().any(|id| id == add_id));
+        let c_outputs = &builder.node_outputs[c_id.as_usize()];
+        assert!(c_outputs.iter().any(|id| id == add_id.0));
 
         // Create sub: node 5 = add - c
         let sub_result = builder.create_sub(&add_result, &c).unwrap();
         let sub_id = builder.get_node_id(&sub_result);
 
         // add_id should now have sub_id as a user
-        let add_outputs = &builder.node_outputs[add_id as usize];
-        assert!(add_outputs.iter().any(|id| id == sub_id));
+        let add_outputs = &builder.node_outputs[add_id.as_usize()];
+        assert!(add_outputs.iter().any(|id| id == sub_id.0));
 
         // c should have both add_id and sub_id as users
-        let c_outputs = &builder.node_outputs[c_id as usize];
-        assert!(c_outputs.iter().any(|id| id == add_id));
-        assert!(c_outputs.iter().any(|id| id == sub_id));
+        let c_outputs = &builder.node_outputs[c_id.as_usize()];
+        assert!(c_outputs.iter().any(|id| id == add_id.0));
+        assert!(c_outputs.iter().any(|id| id == sub_id.0));
     }
 
     #[test]
@@ -1181,17 +1235,17 @@ mod tests {
         let add1_id = builder.get_node_id(&add1);
 
         // Verify c has add1 as a user
-        assert!(builder.node_outputs[c_id as usize].iter().any(|id| id == add1_id));
+        assert!(builder.node_outputs[c_id.as_usize()].iter().any(|id| id == add1_id.0));
 
         // Now replace c (const 5) with const 0
         let zero = Node::const_int(0);
         let new_c_id = builder.replace_node(c_id, &zero);
 
         // Old c should have no outputs left
-        assert!(builder.node_outputs[c_id as usize].is_empty());
+        assert!(builder.node_outputs[c_id.as_usize()].is_empty());
 
         // New zero const should have add1 as a user
-        assert!(builder.node_outputs[new_c_id as usize].iter().any(|id| id == add1_id));
+        assert!(builder.node_outputs[new_c_id.as_usize()].iter().any(|id| id == add1_id.0));
 
         // add1 now references new_c_id instead of c_id
         let add1_inputs: Vec<_> = (0..builder.lookup_node(add1_id).inputs_len())
@@ -1208,15 +1262,15 @@ mod tests {
         let mut builder = IRBuilder::new();
 
         // Default control starts at Entry
-        assert_eq!(builder.current_control(), 1);
+        assert_eq!(builder.current_control(), NodeId(1));
 
         // Create a variable
         let v = builder.create_variable("x");
-        assert_eq!(v, 0);
+        assert_eq!(v, VarId(0));
 
         // Set control to something else
-        builder.set_control(1); // Entry
-        assert_eq!(builder.current_control(), 1);
+        builder.set_control(NodeId(1)); // Entry
+        assert_eq!(builder.current_control(), NodeId(1));
     }
 
     #[test]
@@ -1266,7 +1320,7 @@ mod tests {
 
         // Entry -> If -> Then (single predecessor chain)
         let cond_true = Node::const_bool(true);
-        let if_node = builder.create_if(1, &cond_true);
+        let if_node = builder.create_if(NodeId(1), &cond_true);
         let then_ctrl = builder.create_then(if_node);
 
         // Read at Then — should find x = 5 from Entry (through If)
@@ -1288,7 +1342,7 @@ mod tests {
         // Create control flow: Entry -> If -> Then/Else -> Region
         let cond_true = Node::const_bool(true);
         let _cond_id = builder.push_node(&cond_true);
-        let if_node = builder.create_if(1, &cond_true);
+        let if_node = builder.create_if(NodeId(1), &cond_true);
         let then_ctrl = builder.create_then(if_node);
         let else_ctrl = builder.create_else(if_node);
 
@@ -1308,7 +1362,7 @@ mod tests {
         let result = builder.read_variable(v);
         assert_ne!(result, five_id);
         assert_ne!(result, ten_id);
-        assert_ne!(result, 0); // Not undef
+        assert_ne!(result, NodeId(0)); // Not undef
 
         // The result should be a Phi node with inputs [region, five, ten]
         let phi_node = builder.lookup_node(result);
@@ -1336,7 +1390,7 @@ mod tests {
         // Entry -> If -> Then/Else -> Region
         // Both branches write x = 5 (same value)
         let cond_true = Node::const_bool(true);
-        let if_node = builder.create_if(1, &cond_true);
+        let if_node = builder.create_if(NodeId(1), &cond_true);
         let then_ctrl = builder.create_then(if_node);
         let else_ctrl = builder.create_else(if_node);
 
@@ -1366,7 +1420,7 @@ mod tests {
         builder.write_variable(v, five_id);
 
         // Create a single-predecessor region (artificial, but valid)
-        let region = builder.create_region(&[1]); // Entry -> Region
+        let region = builder.create_region(&[NodeId(1)]); // Entry -> Region
         builder.set_control(region);
 
         // Should find five_id through single predecessor chain, no Phi
@@ -1390,7 +1444,7 @@ mod tests {
         let cond = Node::const_bool(true);
 
         // Outer if
-        let outer_if = builder.create_if(1, &cond);
+        let outer_if = builder.create_if(NodeId(1), &cond);
         let outer_then = builder.create_then(outer_if);
         let outer_else = builder.create_else(outer_if);
 
@@ -1418,7 +1472,7 @@ mod tests {
 
         // Read x — should be a Phi merging the inner Phi's result and 3
         let result = builder.read_variable(v);
-        assert_ne!(result, 0);
+        assert_ne!(result, NodeId(0));
 
         let phi_node = builder.lookup_node(result);
         assert_eq!(phi_node.kind, NodeKind::Phi);
@@ -1449,7 +1503,7 @@ mod tests {
 
         // Manually set up: Entry -> Region (with seal deferred)
         // We'll create a Loop (not auto-sealed) to simulate incomplete CFG
-        let loop_ctrl = builder.create_loop(1); // Entry -> Loop, NOT sealed
+        let loop_ctrl = builder.create_loop(NodeId(1)); // Entry -> Loop, NOT sealed
 
         builder.set_control(loop_ctrl);
 
@@ -1494,7 +1548,7 @@ mod tests {
         builder.write_variable(v0, five_id);
 
         let cond = Node::const_bool(true);
-        let if_node = builder.create_if(1, &cond);
+        let if_node = builder.create_if(NodeId(1), &cond);
         let then_ctrl = builder.create_then(if_node);
         let else_ctrl = builder.create_else(if_node);
 
@@ -1526,7 +1580,7 @@ mod tests {
 
         // Read at Entry with no prior write
         let result = builder.read_variable(v);
-        assert_eq!(result, 0); // Should return Unreachable (node 0)
+        assert_eq!(result, NodeId(0)); // Should return Unreachable (node 0)
     }
 
     #[test]
@@ -1541,7 +1595,7 @@ mod tests {
         let add_id = builder.get_node_id(&add);
 
         // c has add as a user
-        assert!(builder.node_outputs[c_id as usize].iter().any(|id| id == add_id));
+        assert!(builder.node_outputs[c_id.as_usize()].iter().any(|id| id == add_id.0));
 
         // Replace all uses of c (const 5) with another const
         let new_c = Node::const_int(10);
@@ -1549,10 +1603,10 @@ mod tests {
         builder.replace_all_uses(c_id, new_c_id);
 
         // Old c has no users
-        assert!(builder.node_outputs[c_id as usize].is_empty());
+        assert!(builder.node_outputs[c_id.as_usize()].is_empty());
 
         // New c has add as a user
-        assert!(builder.node_outputs[new_c_id as usize].iter().any(|id| id == add_id));
+        assert!(builder.node_outputs[new_c_id.as_usize()].iter().any(|id| id == add_id.0));
 
         // Add now uses new_c_id
         let add_inputs: Vec<_> = (0..builder.lookup_node(add_id).inputs_len())
