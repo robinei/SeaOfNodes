@@ -7,20 +7,30 @@ When something new comes up, add it here.
 
 ## Current Priorities
 
-### P0 — Memory SSA
-Memory nodes (`New`, `Load`, `Store`) are defined as `NodeKind` variants
-but have zero builder methods. Memory is a first-class value in Sea of Nodes
-that flows through the graph like any other value. Without this, we can't
-compile programs with mutable state.
-
-Blockers: none — type system already has `Type::Memory`, control flow and
-SSA construction are ready.
+### P0 ✅ — Memory SSA
+Memory nodes (`New`, `Load`, `Store`) now have builder methods:
+`create_new`, `create_load`, `create_store`. Memory is tracked as a first-class
+SSA value — the same Braun-style algorithm used for variables handles memory
+reaching definitions at control merges, with automatic Phi insertion and
+trivial Phi elimination. Memory-producing ops (`New`, `Store`) auto-update
+the memory chain. `Load` is "amphibious" — it reads from memory without
+producing a new memory state.
 
 ### P1 — Graph visualization
 A `Display` or Debug that emits Graphviz `.dot` output. Debugging graph IRs
 by reading node arrays is painful. Visualization accelerates all future work.
 
-### P2 — End-to-end demo
+### P1 — Memory peephole optimizations
+Fold `Load` immediately after `Store` to same ptr → return stored value.
+Fold `Load` from `New` before any `Store` → return zero/undef initial value.
+Eliminate dead `Store` chains (store to ptr that is never subsequently loaded).
+These are the memory equivalent of the arithmetic peepholes we already have.
+
+### P2 — Graph visualization
+A `Display` or Debug that emits Graphviz `.dot` output. Debugging graph IRs
+by reading node arrays is painful. Visualization accelerates all future work.
+
+### P3 — End-to-end demo
 A tiny expression language + parser that exercises the full pipeline
 (syntax → IR → constant folding → SSA → memory ops). Makes the project
 tangible and catch integration bugs.

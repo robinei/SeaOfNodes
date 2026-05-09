@@ -315,23 +315,34 @@ pub struct IRBuilder {
     variables: Vec<VariableState>,
     sealed: HashSet<NodeId>,
     incomplete_phis: HashMap<(VarId, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
+
+    // Memory SSA tracking — same Braun-style algorithm as variables, but for memory
+    memory_current_def: HashMap<NodeId, NodeId>, // control node -> reaching memory
+    incomplete_memory_phis: HashMap<NodeId, NodeId>, // control node -> operandless memory Phi
 }
 
 impl IRBuilder {
     pub fn new() -> Self {
+        // Create initial nodes: node 0 = Unreachable, node 1 = Entry, node 2 = Memory
+        let mem_node = Node::new(NodeKind::Memory, Type::Memory);
         let mut builder = Self {
             nodes: vec![
                 Node::new(NodeKind::Unreachable, Type::Never),
                 Node::new(NodeKind::Entry, Type::Control),
+                mem_node,
             ],
-            node_outputs: vec![OutputsVec::new(), OutputsVec::new()],
+            node_outputs: vec![OutputsVec::new(), OutputsVec::new(), OutputsVec::new()],
             interned_nodes: HashMap::new(),
             current_control: NodeId(1), // Entry
             variables: Vec::new(),
             sealed: HashSet::new(),
             incomplete_phis: HashMap::new(),
+            memory_current_def: HashMap::new(),
+            incomplete_memory_phis: HashMap::new(),
         };
+        let mem_id = NodeId(2);
         builder.sealed.insert(NodeId(1)); // Entry is sealed from the start
+        builder.memory_current_def.insert(NodeId(1), mem_id); // Entry reaches Memory node
         builder
     }
 
@@ -564,6 +575,119 @@ impl IRBuilder {
         replacement
     }
 
+        // ── Memory SSA Methods ──
+    // These mirror the variable Braun SSA methods but for the implicit memory chain.
+    // Only one "variable" (memory itself) is tracked.
+
+    /// Read the current memory at the current control point.
+    /// Inserts memory Phis as needed (Braun-style lazy SSA construction).
+    pub fn get_current_memory(&mut self) -> NodeId {
+        self.lookup_memory(self.current_control)
+    }
+
+    /// Set the current memory at the current control point.
+    pub fn set_current_memory(&mut self, mem: NodeId) {
+        self.memory_current_def.insert(self.current_control, mem);
+    }
+
+    /// Internal: look up memory at a specific control point, recursing backward if needed.
+    fn lookup_memory(&mut self, ctrl: NodeId) -> NodeId {
+        if let Some(&mem) = self.memory_current_def.get(&ctrl) {
+            return mem;
+        }
+        self.read_memory_recursive(ctrl)
+    }
+
+    /// Braun-style backward search for the reaching memory definition.
+    fn read_memory_recursive(&mut self, ctrl: NodeId) -> NodeId {
+        if !self.sealed.contains(&ctrl) {
+            // Incomplete CFG: place an operandless memory Phi and record it as incomplete
+            let phi = self.create_phi_node(ctrl, &[]);
+            let phi_id = self.push_node(&phi);
+            self.incomplete_memory_phis.insert(ctrl, phi_id);
+            self.memory_current_def.insert(ctrl, phi_id);
+            return phi_id;
+        }
+
+        let preds = self.get_control_predecessors(ctrl);
+        if preds.is_empty() {
+            // No predecessors (e.g., Entry): no reaching memory → NodeId(0) (Unreachable)
+            self.memory_current_def.insert(ctrl, NodeId(0));
+            return NodeId(0);
+        }
+        if preds.len() == 1 {
+            // Single predecessor: just recurse, no Phi needed
+            let mem = self.lookup_memory(preds[0]);
+            self.memory_current_def.insert(ctrl, mem);
+            return mem;
+        }
+
+        // Multiple predecessors: place operandless Phi to break cycles, then fill operands
+        let phi = self.create_phi_node(ctrl, &[]);
+        let phi_id = self.push_node(&phi);
+        self.memory_current_def.insert(ctrl, phi_id);
+        let val = self.add_memory_phi_operands(phi_id, ctrl);
+        self.memory_current_def.insert(ctrl, val);
+        val
+    }
+
+    /// Fill operands of a newly-created memory Phi by recursively reading memory from each predecessor.
+    fn add_memory_phi_operands(&mut self, phi_id: NodeId, ctrl: NodeId) -> NodeId {
+        let preds = self.get_control_predecessors(ctrl);
+        for &pred in &preds {
+            let mem = self.lookup_memory(pred);
+            // Append operand to Phi
+            self.nodes[phi_id.as_usize()].push_input(mem);
+            // Register phi_id as a user of mem
+            self.node_outputs[mem.as_usize()].push(phi_id.0);
+        }
+        // Memory Phis always have Type::Memory
+        self.nodes[phi_id.as_usize()].t = Type::Memory;
+        self.try_remove_trivial_memory_phi(phi_id)
+    }
+
+    /// Detect and remove a trivial memory Phi.
+    /// A memory Phi is trivial if it merges the same memory state (possibly with self-references).
+    fn try_remove_trivial_memory_phi(&mut self, phi_id: NodeId) -> NodeId {
+        let mut same: Option<NodeId> = None;
+        let phi = &self.nodes[phi_id.as_usize()];
+
+        // Skip input[0] (the control region); only consider memory operands
+        for i in 1..phi.inputs_len() {
+            let op = phi.get_input(i);
+            if op == phi_id || Some(op) == same {
+                continue;
+            }
+            if same.is_some() {
+                return phi_id; // At least two distinct memory states: not trivial
+            }
+            same = Some(op);
+        }
+
+        let replacement = match same {
+            Some(v) => v,
+            None => NodeId(0), // Phi references only itself → Unreachable
+        };
+
+        // Snapshot phi's users before rerouting
+        let phi_users: Vec<NodeId> = self.node_outputs[phi_id.as_usize()].iter().map(|x| NodeId(x)).collect();
+
+        // Reroute all uses of phi to replacement
+        self.replace_all_uses(phi_id, replacement);
+
+        // Recursively check Phi users that might have become trivial
+        for &user_id in &phi_users {
+            if user_id != phi_id {
+                let kind = self.nodes[user_id.as_usize()].kind;
+                if kind == NodeKind::Phi {
+                    self.try_remove_trivial_memory_phi(user_id);
+                }
+            }
+        }
+
+        replacement
+    }
+
     /// Get the control predecessors of a control node.
     fn get_control_predecessors(&self, ctrl: NodeId) -> Vec<NodeId> {
         match self.nodes[ctrl.as_usize()].kind {
@@ -595,11 +719,11 @@ impl IRBuilder {
     }
 
     /// Seal a control node — no more predecessors will be added.
-    /// Fills in any incomplete Phis that were placed before sealing.
+    /// Fills in any incomplete Phis (both variable and memory) that were placed before sealing.
     pub fn seal(&mut self, ctrl: NodeId) {
         self.sealed.insert(ctrl);
 
-        // Collect incomplete Phis for this block and fill their operands
+        // Collect incomplete variable Phis for this block and fill their operands
         let keys_to_fill: Vec<(VarId, NodeId)> = self
             .incomplete_phis
             .keys()
@@ -612,6 +736,20 @@ impl IRBuilder {
             let (var, _) = key;
             let result = self.add_phi_operands(var, phi_id, ctrl);
             self.variables[var.as_usize()].current_def.insert(ctrl, result);
+        }
+
+        // Collect incomplete memory Phis for this block and fill their operands
+        let mem_keys: Vec<NodeId> = self
+            .incomplete_memory_phis
+            .keys()
+            .filter(|&&c| c == ctrl)
+            .cloned()
+            .collect();
+
+        for mem_ctrl in mem_keys {
+            let phi_id = self.incomplete_memory_phis.remove(&mem_ctrl).unwrap();
+            let result = self.add_memory_phi_operands(phi_id, ctrl);
+            self.memory_current_def.insert(ctrl, result);
         }
     }
 
@@ -849,6 +987,56 @@ impl IRBuilder {
                 Err(IRError::TypeMismatch)
             }
         }
+    }
+
+    // ── Memory Builder Methods ──
+
+    /// Create a New (allocation) node.
+    /// `mem` is the current memory state (before allocation).
+    /// `alloc_type` is the type of the allocated object (the pointer type).
+    /// Returns a Node whose type is `alloc_type` (the pointer) and whose NodeId
+    /// represents the new memory state after allocation.
+    /// Automatically updates the current memory at the current control point.
+    pub fn create_new(&mut self, mem: NodeId, alloc_type: Type) -> NodeId {
+        let control = self.current_control;
+        let mut node = Node::new(NodeKind::New, alloc_type);
+        node.set_inputs(&[control, mem]);
+        let id = self.push_node(&node);
+        // New produces a new memory state — update the memory chain
+        self.memory_current_def.insert(control, id);
+        id
+    }
+
+    /// Create a Load (memory read) node.
+    /// `mem` is the memory state to read from.
+    /// `ptr` is the pointer (from a New node) to read from.
+    /// `loaded_type` is the type of the loaded value.
+    /// Returns a Node whose type is `loaded_type`.
+    /// Load is "amphibious" — it doesn't produce a new memory state, just reads.
+    pub fn create_load(&mut self, mem: NodeId, ptr: NodeId, loaded_type: Type) -> NodeId {
+        let control = self.current_control;
+        let mut node = Node::new(NodeKind::Load, loaded_type);
+        node.set_inputs(&[control, mem, ptr]);
+        let id = self.push_node(&node);
+        // Load does NOT update the memory chain (it's a read-only projection)
+        id
+    }
+
+    /// Create a Store (memory write) node.
+    /// `mem` is the memory state before the store.
+    /// `ptr` is the pointer (from a New node) to write to.
+    /// `value` is the value to store.
+    /// Returns a Node whose type is `Type::Memory` and whose NodeId represents
+    /// the new memory state after the store.
+    /// Automatically updates the current memory at the current control point.
+    pub fn create_store(&mut self, mem: NodeId, ptr: NodeId, value: NodeId) -> NodeId {
+        let control = self.current_control;
+        let mut node = Node::new(NodeKind::Store, Type::Memory);
+        node.set_inputs(&[control, mem, ptr, value]);
+        let id = self.push_node(&node);
+        // Store produces a new memory state — update the memory chain
+        self.memory_current_def.insert(control, id);
+        id
     }
 }
 
@@ -1791,5 +1979,374 @@ mod tests {
 
         // new_c should have add as a user
         assert!(builder.node_outputs[new_c_id.as_usize()].iter().any(|id| id == add_id.0));
+    }
+
+    // ── Memory Tests ──
+
+    #[test]
+    fn test_memory_node_created() {
+        let builder = IRBuilder::new();
+        // Node 0 = Unreachable, Node 1 = Entry, Node 2 = Memory
+        assert_eq!(builder.nodes[2].kind, NodeKind::Memory);
+        assert_eq!(builder.nodes[2].t, Type::Memory);
+        assert_eq!(builder.nodes[2].inputs_len(), 0);
+    }
+
+    #[test]
+    fn test_memory_current_memory_at_entry() {
+        let mut builder = IRBuilder::new();
+        // At Entry, the current memory should be the Memory node (node 2)
+        assert_eq!(builder.get_current_memory(), NodeId(2));
+    }
+
+    #[test]
+    fn test_memory_set_current_memory() {
+        let mut builder = IRBuilder::new();
+        let mem_id = NodeId(2); // initial Memory node
+        assert_eq!(builder.get_current_memory(), mem_id);
+
+        // Set a different memory (e.g., a Store or New node id)
+        builder.set_current_memory(NodeId(42));
+        assert_eq!(builder.get_current_memory(), NodeId(42));
+    }
+
+    #[test]
+    fn test_memory_single_predecessor_chain() {
+        let mut builder = IRBuilder::new();
+
+        // Entry -> If -> Then (single predecessor chain)
+        let cond_true = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond_true);
+        let then_ctrl = builder.create_then(if_node);
+
+        // Memory at Then should propagate through chain: Entry -> If -> Then
+        builder.set_control(then_ctrl);
+        let mem = builder.get_current_memory();
+        assert_eq!(mem, NodeId(2)); // Should find the initial Memory node
+    }
+
+    #[test]
+    fn test_memory_new_creates_node_and_updates_chain() {
+        let mut builder = IRBuilder::new();
+
+        let mem_id = builder.get_current_memory();
+        assert_eq!(mem_id, NodeId(2)); // initial Memory
+
+        // Allocate: create a new Foo object
+        let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
+        let new_id = builder.create_new(mem_id, foo_type.clone());
+
+        // The New node should be a node with kind New and type foo_type
+        assert_eq!(builder.nodes[new_id.as_usize()].kind, NodeKind::New);
+        assert_eq!(builder.nodes[new_id.as_usize()].t, foo_type);
+
+        // New takes control and mem as inputs
+        assert_eq!(builder.nodes[new_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
+        assert_eq!(builder.nodes[new_id.as_usize()].get_input(1), NodeId(2)); // mem = Memory root
+
+        // Current memory should now be the New node
+        assert_eq!(builder.get_current_memory(), new_id);
+    }
+
+    #[test]
+    fn test_memory_store_creates_node_and_updates_chain() {
+        let mut builder = IRBuilder::new();
+
+        let mem_id = builder.get_current_memory(); // Memory root (node 2)
+        let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
+
+        // Allocate first
+        let ptr = builder.create_new(mem_id, foo_type);
+        // Current memory is now the New node
+
+        // Store: write a value into the allocated object
+        let val = Node::const_int(42);
+        let val_id = builder.push_node(&val);
+        let current_mem = builder.get_current_memory(); // Should be New
+        let store_id = builder.create_store(current_mem, ptr, val_id);
+
+        // The Store node should have kind Store and type Memory
+        assert_eq!(builder.nodes[store_id.as_usize()].kind, NodeKind::Store);
+        assert_eq!(builder.nodes[store_id.as_usize()].t, Type::Memory);
+
+        // Store inputs: [control, mem, ptr, value]
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(1), current_mem); // mem = New node
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(2), ptr);
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(3), val_id);
+
+        // Current memory should now be the Store node
+        assert_eq!(builder.get_current_memory(), store_id);
+    }
+
+    #[test]
+    fn test_memory_load_creates_node() {
+        let mut builder = IRBuilder::new();
+
+        let mem_id = builder.get_current_memory(); // Memory root (node 2)
+        let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
+
+        // Allocate
+        let ptr = builder.create_new(mem_id, foo_type);
+
+        // Load from the allocation
+        let loaded_type = Type::I32;
+        let load_mem = builder.get_current_memory(); // New node
+        let load_id = builder.create_load(load_mem, ptr, loaded_type.clone());
+
+        // The Load node should have kind Load and type I32
+        assert_eq!(builder.nodes[load_id.as_usize()].kind, NodeKind::Load);
+        assert_eq!(builder.nodes[load_id.as_usize()].t, loaded_type);
+
+        // Load inputs: [control, mem, ptr]
+        assert_eq!(builder.nodes[load_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
+        assert_eq!(builder.nodes[load_id.as_usize()].get_input(1), load_mem); // mem = New
+        assert_eq!(builder.nodes[load_id.as_usize()].get_input(2), ptr);
+
+        // Load does NOT update the memory chain — memory should still be the New node
+        assert_eq!(builder.get_current_memory(), load_mem);
+    }
+
+    #[test]
+    fn test_memory_chain_new_then_store_then_load() {
+        let mut builder = IRBuilder::new();
+
+        let mem_root = builder.get_current_memory(); // Memory root (node 2)
+        let obj_type = Type::make_tuple(vec![Type::I32]);
+
+        // Chain: Memory -> New -> Store
+        let ptr = builder.create_new(mem_root, obj_type);
+        let store_mem = builder.get_current_memory(); // should be New
+        let val = Node::const_int(99);
+        let val_id = builder.push_node(&val);
+        let store_id = builder.create_store(store_mem, ptr, val_id);
+
+        // Now load: uses Store's memory state
+        let load_mem = builder.get_current_memory(); // should be Store
+        let load_id = builder.create_load(load_mem, ptr, Type::I32);
+
+        // Verify the chain edges
+        // New: input[1] = Memory root
+        assert_eq!(builder.nodes[ptr.as_usize()].get_input(1), mem_root);
+        // Store: input[1] = New
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(1), store_mem);
+        assert_eq!(builder.nodes[store_id.as_usize()].get_input(3), val_id);
+        // Load: input[1] = Store
+        assert_eq!(builder.nodes[load_id.as_usize()].get_input(1), load_mem);
+
+        // Memory chain: 2 (Memory) -> ptr (New) -> store_id (Store) -> load uses store
+        assert_eq!(mem_root, NodeId(2));
+        assert_eq!(store_mem, ptr);
+        assert_eq!(load_mem, store_id);
+    }
+
+    #[test]
+    fn test_memory_phi_at_merge() {
+        let mut builder = IRBuilder::new();
+
+        let mem_root = builder.get_current_memory(); // Memory root (node 2)
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+        // Entry -> If -> Then/Else -> Region
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then branch: allocate and store
+        builder.set_control(then_ctrl);
+        let then_mem = builder.get_current_memory(); // should propagate from Entry
+        assert_eq!(then_mem, mem_root);
+        let ptr_then = builder.create_new(then_mem, obj_type.clone());
+        let val1 = Node::const_int(1);
+        let val1_id = builder.push_node(&val1);
+        let then_before_store = builder.get_current_memory();
+        builder.create_store(then_before_store, ptr_then, val1_id);
+        let then_final_mem = builder.get_current_memory(); // the Store
+
+        // Else branch: just allocate (different ptr name but same type)
+        builder.set_control(else_ctrl);
+        let else_mem = builder.get_current_memory(); // should propagate from Entry
+        assert_eq!(else_mem, mem_root);
+        let ptr_else = builder.create_new(else_mem, obj_type);
+        let val2 = Node::const_int(2);
+        let val2_id = builder.push_node(&val2);
+        let else_before_store = builder.get_current_memory();
+        builder.create_store(else_before_store, ptr_else, val2_id);
+        let else_final_mem = builder.get_current_memory(); // the Store
+
+        // Merge at Region — memory should be different on both paths, so a memory Phi is needed
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        let merged_mem = builder.get_current_memory();
+
+        // Should be a memory Phi (since Then and Else have different memory states)
+        let phi_node = builder.lookup_node(merged_mem);
+        assert_eq!(phi_node.kind, NodeKind::Phi);
+        assert_eq!(phi_node.t, Type::Memory);
+        assert_eq!(phi_node.get_input(0), region);
+
+        // The Phi should merge the two final memory states
+        let op1 = phi_node.get_input(1);
+        let op2 = phi_node.get_input(2);
+        assert!(
+            (op1 == then_final_mem && op2 == else_final_mem) || (op1 == else_final_mem && op2 == then_final_mem),
+            "Memory Phi should merge Then and Else memory states, got {} and {}",
+            op1,
+            op2
+        );
+    }
+
+    #[test]
+    fn test_memory_trivial_phi_elimination() {
+        let mut builder = IRBuilder::new();
+
+        // Entry -> If -> Then/Else -> Region
+        // Both branches have the SAME memory (no stores/allocations), so memory Phi should be trivial
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Neither branch modifies memory — both reach the same Memory root
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // No memory Phi needed — both paths reach the same memory (Memory root = node 2)
+        let mem = builder.get_current_memory();
+        assert_eq!(mem, NodeId(2)); // Directly the Memory root, no Phi
+    }
+
+    #[test]
+    fn test_memory_partial_definition_at_merge() {
+        // Memory modified on one branch only, passes through on the other
+        let mut builder = IRBuilder::new();
+
+        let mem_root = builder.get_current_memory();
+
+        // Entry -> If -> Then/Else -> Region
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(NodeId(1), &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then branch: allocate (changes memory)
+        builder.set_control(then_ctrl);
+        let obj_type = Type::make_record(vec![("x", Type::I32)]);
+        let then_ctrl_mem = builder.get_current_memory();
+        let _ptr_then = builder.create_new(then_ctrl_mem, obj_type);
+        let then_mem = builder.get_current_memory(); // the New node
+
+        // Else branch: NO memory modification — still has the Memory root
+        builder.set_control(else_ctrl);
+        // Current memory here should propagate through Entry -> If -> Else, landing on Memory root
+        assert_eq!(builder.get_current_memory(), mem_root);
+
+        // Merge at Region
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        let merged_mem = builder.get_current_memory();
+
+        // Should be a Phi: merges 'then_mem' (New) and mem_root (Memory) since one path changed it
+        let phi_node = builder.lookup_node(merged_mem);
+        assert_eq!(phi_node.kind, NodeKind::Phi);
+        assert_eq!(phi_node.t, Type::Memory);
+
+        let op1 = phi_node.get_input(1);
+        let op2 = phi_node.get_input(2);
+        assert!(
+            (op1 == then_mem && op2 == mem_root) || (op1 == mem_root && op2 == then_mem),
+            "Memory Phi should merge then_mem ({}) and mem_root ({}), got {} and {}",
+            then_mem, mem_root, op1, op2
+        );
+    }
+
+    #[test]
+    fn test_memory_load_after_store_reads_same() {
+        // In Sea of Nodes, the memory chain naturally orders operations.
+        // A Load that uses Store as its memory input reads the value after the store.
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let point_type = Type::make_record(vec![("x", Type::I32)]);
+
+        // Allocate, store x=42, then load x
+        let ptr = builder.create_new(mem, point_type);
+        let val = Node::const_int(42);
+        let val_id = builder.push_node(&val);
+        let store_before = builder.get_current_memory();
+        let store_mem = builder.create_store(store_before, ptr, val_id);
+
+        // Load from same ptr, using Store as memory — this reads AFTER the store
+        let _load_id = builder.create_load(store_mem, ptr, Type::I32);
+
+        // The chain: Memory -> New -> Store -> Load
+        // Load's memory edge is Store, guaranteeing it executes after the store
+        assert_eq!(builder.nodes[_load_id.as_usize()].get_input(1), store_mem);
+    }
+
+    #[test]
+    fn test_memory_incomplete_phi_on_seal() {
+        // Test that memory Phis placed before a block is sealed get filled on seal()
+        let mut builder = IRBuilder::new();
+
+        // Create a Loop (not auto-sealed) to simulate incomplete CFG
+        let loop_ctrl = builder.create_loop(NodeId(1)); // Entry -> Loop, NOT sealed
+        builder.set_control(loop_ctrl);
+
+        // Read memory at unsealed loop — creates an incomplete memory Phi
+        let _mem_at_loop = builder.get_current_memory();
+
+        // The incomplete_memory_phis should have an entry
+        assert!(builder.incomplete_memory_phis.contains_key(&loop_ctrl));
+
+        // Create back-edge and seal
+        let back_edge = builder.create_region(&[loop_ctrl]);
+        builder.push_loop_back_edge(loop_ctrl, back_edge);
+        builder.seal(loop_ctrl);
+
+        // After sealing, the incomplete memory Phi should have been filled
+        assert!(!builder.incomplete_memory_phis.contains_key(&loop_ctrl));
+
+        // Memory at loop should be resolved (either Memory root, or a trivial Phi collapsed)
+        let mem = builder.get_current_memory();
+        assert_eq!(mem, NodeId(2)); // Both predecessors reach Memory root — Phi collapsed
+    }
+
+    #[test]
+    fn test_memory_output_tracking() {
+        // Verify that memory operations properly track output edges
+        let mut builder = IRBuilder::new();
+
+        let mem = builder.get_current_memory();
+        let obj_type = Type::make_tuple(vec![Type::I32]);
+
+        // Allocate: New consumes Memory, produces ptr/NewMem
+        let ptr = builder.create_new(mem, obj_type);
+
+        // Memory root should have New as a user
+        assert!(builder.node_outputs[mem.as_usize()]
+            .iter()
+            .any(|id| id == ptr.0));
+
+        // Store should have New as a user (since Store's mem input = New)
+        let val = Node::const_int(7);
+        let val_id = builder.push_node(&val);
+        let store_mem_before = builder.get_current_memory();
+        let store = builder.create_store(store_mem_before, ptr, val_id);
+
+        // New should have Store as a user
+        assert!(builder.node_outputs[ptr.as_usize()]
+            .iter()
+            .any(|id| id == store.0));
+
+        // Load should have Store as a user
+        let load_mem = builder.get_current_memory();
+        let load = builder.create_load(load_mem, ptr, Type::I32);
+        assert!(builder.node_outputs[store.as_usize()]
+            .iter()
+            .any(|id| id == load.0));
     }
 }
