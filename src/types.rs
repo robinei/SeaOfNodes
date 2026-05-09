@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 
-use crate::IRError;
+use crate::node::IRError;
 use crate::constraints::*;
 use crate::symbols::SymbolId;
 
