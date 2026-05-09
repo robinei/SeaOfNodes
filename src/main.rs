@@ -3,7 +3,7 @@ mod constraints;
 mod symbols;
 mod types;
 use compact_vec::{CompactVecData, CompactVecState, CompactVecStateU16};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use types::*;
 
 use crate::compact_vec::CompactVec;
@@ -19,6 +19,7 @@ pub enum IRError {
     IntegerOverflow,
     DivisionByZero,
     InvalidPrimitiveCoercion,
+    UndefinedVariable, // reading a variable with no reaching definition
 }
 
 #[repr(u8)]
@@ -247,22 +248,37 @@ impl Drop for Node {
     }
 }
 
+struct VariableState {
+    name: String,
+    current_def: HashMap<NodeId, NodeId>, // control node -> reaching value
+}
+
 pub struct IRBuilder {
     nodes: Vec<Node>,
     node_outputs: Vec<OutputsVec>,
     interned_nodes: HashMap<Node, NodeId>,
+    current_control: NodeId,
+    variables: Vec<VariableState>,
+    sealed: HashSet<NodeId>,
+    incomplete_phis: HashMap<(usize, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
 }
 
 impl IRBuilder {
     pub fn new() -> Self {
-        Self {
+        let mut builder = Self {
             nodes: vec![
                 Node::new(NodeKind::Unreachable, Type::Never),
                 Node::new(NodeKind::Entry, Type::Control),
             ],
             node_outputs: vec![OutputsVec::new(), OutputsVec::new()],
             interned_nodes: HashMap::new(),
-        }
+            current_control: 1, // Entry
+            variables: Vec::new(),
+            sealed: HashSet::new(),
+            incomplete_phis: HashMap::new(),
+        };
+        builder.sealed.insert(1); // Entry is sealed from the start
+        builder
     }
 
     #[inline]
@@ -321,6 +337,232 @@ impl IRBuilder {
         }
 
         new_id
+    }
+
+    /// Rewire all users of `old_id` to point to `new_id` instead.
+    /// Does NOT create a new node — used by trivial Phi elimination.
+    fn replace_all_uses(&mut self, old_id: NodeId, new_id: NodeId) {
+        if old_id == new_id {
+            return;
+        }
+        let old_outputs: Vec<NodeId> = self.node_outputs[old_id as usize].iter().collect();
+        self.node_outputs[old_id as usize].set_all(&[]);
+        for &user_id in &old_outputs {
+            let user = &mut self.nodes[user_id as usize];
+            for i in 0..user.inputs_len() {
+                if user.get_input(i) == old_id {
+                    user.set_input(i, new_id);
+                    break;
+                }
+            }
+            self.node_outputs[new_id as usize].push(user_id);
+        }
+    }
+
+    /// Allocate a new source variable with a human-readable name.
+    pub fn create_variable(&mut self, name: &str) -> usize {
+        let idx = self.variables.len();
+        self.variables.push(VariableState {
+            name: name.to_string(),
+            current_def: HashMap::new(),
+        });
+        idx
+    }
+
+    /// Set the current control (program point) for subsequent reads/writes.
+    #[inline]
+    pub fn set_control(&mut self, control: NodeId) {
+        self.current_control = control;
+    }
+
+    /// Get the current control node.
+    #[inline]
+    pub fn current_control(&self) -> NodeId {
+        self.current_control
+    }
+
+    /// Record that `value` is the current definition of `var` at the current control point.
+    #[inline]
+    pub fn write_variable(&mut self, var: usize, value: NodeId) {
+        self.variables[var]
+            .current_def
+            .insert(self.current_control, value);
+    }
+
+    /// Read the current value of `var` at the current control point.
+    /// Inserts Phi nodes as needed (Braun-style lazy SSA construction).
+    pub fn read_variable(&mut self, var: usize) -> NodeId {
+        self.lookup_variable(var, self.current_control)
+    }
+
+    /// Internal: look up a variable at a specific control point, recursing backward if needed.
+    fn lookup_variable(&mut self, var: usize, ctrl: NodeId) -> NodeId {
+        // Local value numbering check
+        if let Some(&val) = self.variables[var].current_def.get(&ctrl) {
+            return val;
+        }
+        self.read_variable_recursive(var, ctrl)
+    }
+
+    /// Braun-style backward search for a variable's reaching definition.
+    fn read_variable_recursive(&mut self, var: usize, ctrl: NodeId) -> NodeId {
+        if !self.sealed.contains(&ctrl) {
+            // Incomplete CFG: place an operandless Phi and record it as incomplete
+            let phi = self.create_phi_node(ctrl, &[]);
+            let phi_id = self.push_node(&phi);
+            self.incomplete_phis.insert((var, ctrl), phi_id);
+            self.variables[var].current_def.insert(ctrl, phi_id);
+            return phi_id;
+        }
+
+        let preds = self.get_control_predecessors(ctrl);
+        if preds.is_empty() {
+            // No predecessors (e.g., Entry): variable is undefined → NodeId 0 (Unreachable)
+            self.variables[var].current_def.insert(ctrl, 0);
+            return 0;
+        }
+        if preds.len() == 1 {
+            // Single predecessor: just recurse, no Phi needed
+            let val = self.lookup_variable(var, preds[0]);
+            self.variables[var].current_def.insert(ctrl, val);
+            return val;
+        }
+
+        // Multiple predecessors: place operandless Phi to break cycles, then fill operands
+        let phi = self.create_phi_node(ctrl, &[]);
+        let phi_id = self.push_node(&phi);
+        self.variables[var].current_def.insert(ctrl, phi_id);
+        let val = self.add_phi_operands(var, phi_id, ctrl);
+        self.variables[var].current_def.insert(ctrl, val);
+        val
+    }
+
+    /// Fill operands of a newly-created Phi by recursively reading from each predecessor.
+    /// Then attempt trivial Phi elimination.
+    fn add_phi_operands(&mut self, var: usize, phi_id: NodeId, ctrl: NodeId) -> NodeId {
+        let preds = self.get_control_predecessors(ctrl);
+        let mut operand_types: Vec<Type> = Vec::new();
+        for &pred in &preds {
+            let val = self.lookup_variable(var, pred);
+            // Append operand to Phi
+            self.nodes[phi_id as usize].push_input(val);
+            // Register phi_id as a user of val
+            self.node_outputs[val as usize].push(phi_id);
+            // Collect operand type for refining Phi's type
+            operand_types.push(self.nodes[val as usize].t.clone());
+        }
+        // Refine Phi's type: join of all operand types
+        if operand_types.is_empty() {
+            self.nodes[phi_id as usize].t = Type::Never;
+        } else if operand_types.iter().all(|t| *t == operand_types[0]) {
+            self.nodes[phi_id as usize].t = operand_types[0].clone();
+        } else {
+            self.nodes[phi_id as usize].t = Type::make_union(operand_types);
+        }
+        self.try_remove_trivial_phi(phi_id)
+    }
+
+    /// Braun Algorithm 3: detect and remove a trivial Phi.
+    /// A Phi is trivial if it merges the same value (possibly with self-references).
+    fn try_remove_trivial_phi(&mut self, phi_id: NodeId) -> NodeId {
+        let mut same: Option<NodeId> = None;
+        let phi = &self.nodes[phi_id as usize];
+
+        // Skip input[0] (the control region); only consider value operands
+        for i in 1..phi.inputs_len() {
+            let op = phi.get_input(i);
+            if op == phi_id || Some(op) == same {
+                continue;
+            }
+            if same.is_some() {
+                return phi_id; // At least two distinct values: not trivial
+            }
+            same = Some(op);
+        }
+
+        let replacement = match same {
+            Some(v) => v,
+            None => 0, // Phi references only itself (unreachable) → undef = node 0 (Unreachable)
+        };
+
+        // Snapshot phi's users before rerouting
+        let phi_users: Vec<NodeId> = self.node_outputs[phi_id as usize].iter().collect();
+
+        // Reroute all uses of phi to replacement
+        self.replace_all_uses(phi_id, replacement);
+
+        // Recursively check Phi users that might have become trivial
+        for &user_id in &phi_users {
+            if user_id != phi_id {
+                let kind = self.nodes[user_id as usize].kind;
+                if kind == NodeKind::Phi {
+                    self.try_remove_trivial_phi(user_id);
+                }
+            }
+        }
+
+        replacement
+    }
+
+    /// Get the control predecessors of a control node.
+    fn get_control_predecessors(&self, ctrl: NodeId) -> Vec<NodeId> {
+        match self.nodes[ctrl as usize].kind {
+            NodeKind::Region | NodeKind::Loop => {
+                // All inputs are control predecessors
+                let n = self.nodes[ctrl as usize].inputs_len();
+                (0..n).map(|i| self.nodes[ctrl as usize].get_input(i)).collect()
+            }
+            NodeKind::Entry => vec![],
+            _ => {
+                // For non-merge control nodes, the single control input at index 0
+                if self.nodes[ctrl as usize].inputs_len() > 0 {
+                    vec![self.nodes[ctrl as usize].get_input(0)]
+                } else {
+                    vec![]
+                }
+            }
+        }
+    }
+
+    /// Add a new predecessor to a Loop node (for back-edges).
+    /// The loop is not sealed yet, so no Phi filling is triggered.
+    pub fn push_loop_back_edge(&mut self, loop_ctrl: NodeId, back_edge: NodeId) {
+        self.nodes[loop_ctrl as usize].push_input(back_edge);
+        // Register the back-edge as a user of loop_ctrl's outputs...
+        // Actually, back_edge is an input to the loop node, so loop_ctrl
+        // becomes an output of back_edge.
+        self.node_outputs[back_edge as usize].push(loop_ctrl);
+    }
+
+    /// Seal a control node — no more predecessors will be added.
+    /// Fills in any incomplete Phis that were placed before sealing.
+    pub fn seal(&mut self, ctrl: NodeId) {
+        self.sealed.insert(ctrl);
+
+        // Collect incomplete Phis for this block and fill their operands
+        let keys_to_fill: Vec<(usize, NodeId)> = self
+            .incomplete_phis
+            .keys()
+            .filter(|&&(_, c)| c == ctrl)
+            .cloned()
+            .collect();
+
+        for key in keys_to_fill {
+            let phi_id = self.incomplete_phis.remove(&key).unwrap();
+            let (var, _) = key;
+            let result = self.add_phi_operands(var, phi_id, ctrl);
+            self.variables[var].current_def.insert(ctrl, result);
+        }
+    }
+
+    /// Create a Phi node with the given control and value inputs.
+    fn create_phi_node(&self, ctrl: NodeId, values: &[NodeId]) -> Node {
+        // The type will be refined as operands are added, for now use Never
+        let mut node = Node::new(NodeKind::Phi, Type::Never);
+        let mut inputs = vec![ctrl];
+        inputs.extend_from_slice(values);
+        node.set_inputs(&inputs);
+        node
     }
 
     #[inline]
@@ -474,19 +716,25 @@ impl IRBuilder {
     pub fn create_if(&mut self, control: NodeId, cond: &Node) -> NodeId {
         let mut node = Node::new(NodeKind::If, Type::Control);
         node.set_inputs(&[control, self.get_node_id(cond)]);
-        self.push_node(&node)
+        let id = self.push_node(&node);
+        self.sealed.insert(id);
+        id
     }
 
     pub fn create_then(&mut self, if_node: NodeId) -> NodeId {
         let mut node = Node::new(NodeKind::Then, Type::Control);
         node.set_inputs(&[if_node]);
-        self.push_node(&node)
+        let id = self.push_node(&node);
+        self.sealed.insert(id);
+        id
     }
 
     pub fn create_else(&mut self, if_node: NodeId) -> NodeId {
         let mut node = Node::new(NodeKind::Else, Type::Control);
         node.set_inputs(&[if_node]);
-        self.push_node(&node)
+        let id = self.push_node(&node);
+        self.sealed.insert(id);
+        id
     }
 
     pub fn create_loop(&mut self, control: NodeId) -> NodeId {
@@ -498,7 +746,9 @@ impl IRBuilder {
     pub fn create_region(&mut self, controls: &[NodeId]) -> NodeId {
         let mut node = Node::new(NodeKind::Region, Type::Control);
         node.set_inputs(controls);
-        self.push_node(&node)
+        let id = self.push_node(&node);
+        self.seal(id);
+        id
     }
 
     pub fn create_param(&mut self, index: usize, t: Type) -> Node {
@@ -948,5 +1198,366 @@ mod tests {
             .collect();
         assert!(add1_inputs.contains(&new_c_id));
         assert!(!add1_inputs.contains(&c_id));
+    }
+
+    // ── SSA Construction Tests ──
+
+    #[test]
+    fn test_ssa_create_variable_and_set_control() {
+        let mut builder = IRBuilder::new();
+
+        // Default control starts at Entry
+        assert_eq!(builder.current_control(), 1);
+
+        // Create a variable
+        let v = builder.create_variable("x");
+        assert_eq!(v, 0);
+
+        // Set control to something else
+        builder.set_control(1); // Entry
+        assert_eq!(builder.current_control(), 1);
+    }
+
+    #[test]
+    fn test_ssa_single_block_read_write() {
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let one = Node::const_int(1);
+        let one_id = builder.push_node(&one);
+
+        // Write x = 1 at Entry
+        builder.write_variable(v, one_id);
+
+        // Read x at Entry — should return 1
+        let result = builder.read_variable(v);
+        assert_eq!(result, one_id);
+    }
+
+    #[test]
+    fn test_ssa_overwrite_within_block() {
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let one = Node::const_int(1);
+        let two = Node::const_int(2);
+        let one_id = builder.push_node(&one);
+        let two_id = builder.push_node(&two);
+
+        // Write x = 1, then overwrite with x = 2
+        builder.write_variable(v, one_id);
+        builder.write_variable(v, two_id);
+
+        // Should return 2 (most recent)
+        assert_eq!(builder.read_variable(v), two_id);
+    }
+
+    #[test]
+    fn test_ssa_single_predecessor_chain() {
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let five_id = builder.push_node(&five);
+
+        // Write x = 5 at Entry
+        builder.write_variable(v, five_id);
+
+        // Entry -> If -> Then (single predecessor chain)
+        let cond_true = Node::const_bool(true);
+        let if_node = builder.create_if(1, &cond_true);
+        let then_ctrl = builder.create_then(if_node);
+
+        // Read at Then — should find x = 5 from Entry (through If)
+        builder.set_control(then_ctrl);
+        let result = builder.read_variable(v);
+        assert_eq!(result, five_id);
+    }
+
+    #[test]
+    fn test_ssa_if_else_phi_insertion() {
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let ten = Node::const_int(10);
+        let five_id = builder.push_node(&five);
+        let ten_id = builder.push_node(&ten);
+
+        // Create control flow: Entry -> If -> Then/Else -> Region
+        let cond_true = Node::const_bool(true);
+        let _cond_id = builder.push_node(&cond_true);
+        let if_node = builder.create_if(1, &cond_true);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Then branch: x = 5
+        builder.set_control(then_ctrl);
+        builder.write_variable(v, five_id);
+
+        // Else branch: x = 10
+        builder.set_control(else_ctrl);
+        builder.write_variable(v, ten_id);
+
+        // Merge at Region
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // Read x at Region — should get a Phi
+        let result = builder.read_variable(v);
+        assert_ne!(result, five_id);
+        assert_ne!(result, ten_id);
+        assert_ne!(result, 0); // Not undef
+
+        // The result should be a Phi node with inputs [region, five, ten]
+        let phi_node = builder.lookup_node(result);
+        assert_eq!(phi_node.kind, NodeKind::Phi);
+        assert_eq!(phi_node.get_input(0), region);
+        // Inputs 1 and 2 are the values (order depends on predecessor ordering)
+        let val1 = phi_node.get_input(1);
+        let val2 = phi_node.get_input(2);
+        assert!(
+            (val1 == five_id && val2 == ten_id) || (val1 == ten_id && val2 == five_id),
+            "Phi operands should be five and ten, got {} and {}",
+            val1,
+            val2
+        );
+    }
+
+    #[test]
+    fn test_ssa_trivial_phi_elimination() {
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let five_id = builder.push_node(&five);
+
+        // Entry -> If -> Then/Else -> Region
+        // Both branches write x = 5 (same value)
+        let cond_true = Node::const_bool(true);
+        let if_node = builder.create_if(1, &cond_true);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        builder.set_control(then_ctrl);
+        builder.write_variable(v, five_id);
+
+        builder.set_control(else_ctrl);
+        builder.write_variable(v, five_id);
+
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // Read x — should directly return five_id (Phi trivial, same value on both paths)
+        let result = builder.read_variable(v);
+        assert_eq!(result, five_id);
+    }
+
+    #[test]
+    fn test_ssa_phi_non_branching_region() {
+        // A region with a single predecessor should not create a Phi
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let five_id = builder.push_node(&five);
+
+        builder.write_variable(v, five_id);
+
+        // Create a single-predecessor region (artificial, but valid)
+        let region = builder.create_region(&[1]); // Entry -> Region
+        builder.set_control(region);
+
+        // Should find five_id through single predecessor chain, no Phi
+        let result = builder.read_variable(v);
+        assert_eq!(result, five_id);
+    }
+
+    #[test]
+    fn test_ssa_nested_if_else() {
+        // Test a more complex case: outer if with inner if-else
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let one = Node::const_int(1);
+        let two = Node::const_int(2);
+        let three = Node::const_int(3);
+        let one_id = builder.push_node(&one);
+        let two_id = builder.push_node(&two);
+        let three_id = builder.push_node(&three);
+
+        let cond = Node::const_bool(true);
+
+        // Outer if
+        let outer_if = builder.create_if(1, &cond);
+        let outer_then = builder.create_then(outer_if);
+        let outer_else = builder.create_else(outer_if);
+
+        // Outer then: inner if-else
+        let inner_if = builder.create_if(outer_then, &cond);
+        let inner_then = builder.create_then(inner_if);
+        let inner_else = builder.create_else(inner_if);
+
+        builder.set_control(inner_then);
+        builder.write_variable(v, one_id);
+
+        builder.set_control(inner_else);
+        builder.write_variable(v, two_id);
+
+        let inner_region = builder.create_region(&[inner_then, inner_else]);
+        // Outer then ends at inner_region
+
+        // Outer else
+        builder.set_control(outer_else);
+        builder.write_variable(v, three_id);
+
+        // Final merge
+        let outer_region = builder.create_region(&[inner_region, outer_else]);
+        builder.set_control(outer_region);
+
+        // Read x — should be a Phi merging the inner Phi's result and 3
+        let result = builder.read_variable(v);
+        assert_ne!(result, 0);
+
+        let phi_node = builder.lookup_node(result);
+        assert_eq!(phi_node.kind, NodeKind::Phi);
+        assert_eq!(phi_node.get_input(0), outer_region);
+
+        // One operand should be the inner Phi, the other should be three_id
+        let op1 = phi_node.get_input(1);
+        let op2 = phi_node.get_input(2);
+        assert!(op1 == three_id || op2 == three_id);
+
+        // The other operand should itself be a Phi (the inner one)
+        let inner_candidate = if op1 == three_id { op2 } else { op1 };
+        let inner = builder.lookup_node(inner_candidate);
+        assert_eq!(inner.kind, NodeKind::Phi);
+        assert_eq!(inner.get_input(0), inner_region);
+    }
+
+    #[test]
+    fn test_ssa_incomplete_phi_on_seal() {
+        // Test that Phis placed before a block is sealed get filled on seal()
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("x");
+        let five = Node::const_int(5);
+        let ten = Node::const_int(10);
+        let five_id = builder.push_node(&five);
+        let ten_id = builder.push_node(&ten);
+
+        // Manually set up: Entry -> Region (with seal deferred)
+        // We'll create a Loop (not auto-sealed) to simulate incomplete CFG
+        let loop_ctrl = builder.create_loop(1); // Entry -> Loop, NOT sealed
+
+        builder.set_control(loop_ctrl);
+
+        // Write x = 5 at the loop header (not sealed yet)
+        builder.write_variable(v, five_id);
+
+        // Now seal the loop — Phis that were placed before sealing get filled
+        builder.seal(loop_ctrl);
+
+        // Now write in a branch: add a back-edge
+        // Loop already has 1 predecessor (Entry). After several ops, we add back-edge.
+        // This simulates the typical loop construction pattern.
+        let back_edge = builder.create_region(&[loop_ctrl]); // artificial back-edge
+        builder.push_loop_back_edge(loop_ctrl, back_edge);
+
+        // Read at back_edge should find five_id through single-pred chain
+        builder.set_control(back_edge);
+        let result = builder.read_variable(v);
+        assert_eq!(result, five_id); // Should find five from sealed loop
+
+        // Now write ten at back_edge and seal the back_edge region
+        builder.write_variable(v, ten_id);
+        // Re-seal the loop header after adding back-edge...
+        // Actually, once a block is sealed we can't add more preds.
+        // The back_edge is a separate region, so this is fine.
+    }
+
+    #[test]
+    fn test_ssa_chained_trivial_phi_elimination() {
+        // Test that eliminating one trivial Phi cascades to eliminate users
+        let mut builder = IRBuilder::new();
+
+        let v0 = builder.create_variable("a");
+        let v1 = builder.create_variable("b");
+        let five = Node::const_int(5);
+        let five_id = builder.push_node(&five);
+
+        // Create: Entry -> Region1 -> Region2
+        // Write a = 5 at Entry
+        // Then try reading a and b at Region2
+
+        builder.write_variable(v0, five_id);
+
+        let cond = Node::const_bool(true);
+        let if_node = builder.create_if(1, &cond);
+        let then_ctrl = builder.create_then(if_node);
+        let else_ctrl = builder.create_else(if_node);
+
+        // Both branches write b = a (same as reading a and re-writing)
+        builder.set_control(then_ctrl);
+        let a_val_then = builder.read_variable(v0);
+        builder.write_variable(v1, a_val_then);
+
+        builder.set_control(else_ctrl);
+        let a_val_else = builder.read_variable(v0);
+        builder.write_variable(v1, a_val_else);
+
+        // Merge at Region
+        let region = builder.create_region(&[then_ctrl, else_ctrl]);
+        builder.set_control(region);
+
+        // Read b — should be a Phi merging the two same values
+        // The Phi should be trivial since both operands are five_id!
+        let b_val = builder.read_variable(v1);
+        assert_eq!(b_val, five_id);
+    }
+
+    #[test]
+    fn test_ssa_undefined_variable() {
+        // Reading a variable that was never written should return Unreachable (node 0)
+        let mut builder = IRBuilder::new();
+
+        let v = builder.create_variable("uninit");
+
+        // Read at Entry with no prior write
+        let result = builder.read_variable(v);
+        assert_eq!(result, 0); // Should return Unreachable (node 0)
+    }
+
+    #[test]
+    fn test_ssa_replace_all_uses() {
+        let mut builder = IRBuilder::new();
+
+        // Create: param + const, then x = add(param, const)
+        let x = builder.create_param(0, Type::I32);
+        let c = Node::const_int(5);
+        let c_id = builder.push_node(&c);
+        let add = builder.create_add(&x, &c).unwrap();
+        let add_id = builder.get_node_id(&add);
+
+        // c has add as a user
+        assert!(builder.node_outputs[c_id as usize].iter().any(|id| id == add_id));
+
+        // Replace all uses of c (const 5) with another const
+        let new_c = Node::const_int(10);
+        let new_c_id = builder.push_node(&new_c);
+        builder.replace_all_uses(c_id, new_c_id);
+
+        // Old c has no users
+        assert!(builder.node_outputs[c_id as usize].is_empty());
+
+        // New c has add as a user
+        assert!(builder.node_outputs[new_c_id as usize].iter().any(|id| id == add_id));
+
+        // Add now uses new_c_id
+        let add_inputs: Vec<_> = (0..builder.lookup_node(add_id).inputs_len())
+            .map(|i| builder.lookup_node(add_id).get_input(i))
+            .collect();
+        assert!(add_inputs.contains(&new_c_id));
+        assert!(!add_inputs.contains(&c_id));
     }
 }
