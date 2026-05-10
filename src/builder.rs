@@ -760,4 +760,20 @@ impl IRBuilder {
     pub fn has_work(&self) -> bool {
         !self.worklist.is_empty()
     }
+
+    /// Serialize the graph to Graphviz DOT format for debugging.
+    /// Variable names (from SSA variable tracking) are included in node labels.
+    pub fn to_dot(&self) -> String {
+        let mut var_labels = std::collections::HashMap::new();
+        for var in &self.variables {
+            for (_, &node_id) in &var.current_def {
+                let entry = var_labels.entry(node_id).or_insert_with(String::new);
+                if !entry.is_empty() {
+                    entry.push_str(", ");
+                }
+                entry.push_str(&var.name);
+            }
+        }
+        crate::dot::graph_to_dot(&self.nodes, &self.node_outputs, &var_labels)
+    }
 }

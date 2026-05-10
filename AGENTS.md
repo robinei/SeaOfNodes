@@ -45,6 +45,7 @@ See [`PLAN.md`](./PLAN.md) for the prioritized roadmap.
 ├── Cargo.toml
 └── src/
     ├── main.rs        # Module declarations, main entry point
+    ├── dot.rs         # Graphviz DOT output for debugging (edge roles, rank layout, coloring)
     ├── node.rs        # Node, NodeId, NodeKind, node operations
     ├── builder.rs     # IRBuilder, SSA construction (Braun-style lazy Phis)
     ├── types.rs       # Type algebra (union, intersect, subtract, cast analysis)
