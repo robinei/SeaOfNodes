@@ -88,7 +88,7 @@ impl IRBuilder {
     }
 
     #[inline]
-    pub(crate) fn push_node(&mut self, node: &Node) -> NodeId {
+    pub(crate) fn intern_node(&mut self, node: &Node) -> NodeId {
         // For pure nodes, check if already interned (avoids duplicates)
         if node.kind.is_pure() {
             if let Some(&id) = self.interned_nodes.get(node) {
@@ -119,7 +119,7 @@ impl IRBuilder {
     /// Replace an existing node entirely, keeping all outputs perfectly in sync.
     /// All users of old_id are rewired to point to the new node.
     pub fn replace_node(&mut self, old_id: NodeId, new_node: &Node) -> NodeId {
-        let new_id = self.push_node(new_node);
+        let new_id = self.intern_node(new_node);
         self.replace_all_uses(old_id, new_id);
         new_id
     }
@@ -229,7 +229,7 @@ impl IRBuilder {
         if !self.sealed.contains(&ctrl) {
             // Incomplete CFG: place an operandless Phi and record it as incomplete
             let phi = self.create_phi_node(ctrl, &[]);
-            let phi_id = self.push_node(&phi);
+            let phi_id = self.intern_node(&phi);
             self.incomplete_phis.insert((var, ctrl), phi_id);
             self.variables[var.as_usize()].current_def.insert(ctrl, phi_id);
             return phi_id;
@@ -250,7 +250,7 @@ impl IRBuilder {
 
         // Multiple predecessors: place operandless Phi to break cycles, then fill operands
         let phi = self.create_phi_node(ctrl, &[]);
-        let phi_id = self.push_node(&phi);
+        let phi_id = self.intern_node(&phi);
         self.variables[var.as_usize()].current_def.insert(ctrl, phi_id);
         let val = self.add_phi_operands(var, phi_id, ctrl);
         self.variables[var.as_usize()].current_def.insert(ctrl, val);
@@ -414,7 +414,7 @@ impl IRBuilder {
         if let Some(identity_id) = node.get_identity_id() {
             identity_id
         } else if node.kind.is_pure() {
-            self.push_node(node) // push_node handles interning
+            self.intern_node(node) // intern_node handles interning
         } else {
             panic!("can't intern impure node - they need to have identity")
         }
@@ -554,7 +554,7 @@ impl IRBuilder {
     pub fn create_if(&mut self, control: NodeId, cond: &Node) -> NodeId {
         let mut node = Node::new(NodeKind::If, Type::Control);
         node.set_inputs(&[control, self.get_node_id(cond)]);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.sealed.insert(id);
         id
     }
@@ -562,7 +562,7 @@ impl IRBuilder {
     pub fn create_then(&mut self, if_node: NodeId) -> NodeId {
         let mut node = Node::new(NodeKind::Then, Type::Control);
         node.set_inputs(&[if_node]);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.sealed.insert(id);
         id
     }
@@ -570,7 +570,7 @@ impl IRBuilder {
     pub fn create_else(&mut self, if_node: NodeId) -> NodeId {
         let mut node = Node::new(NodeKind::Else, Type::Control);
         node.set_inputs(&[if_node]);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.sealed.insert(id);
         id
     }
@@ -578,13 +578,13 @@ impl IRBuilder {
     pub fn create_loop(&mut self, control: NodeId) -> NodeId {
         let mut node = Node::new(NodeKind::Loop, Type::Control);
         node.set_inputs(&[control]);
-        self.push_node(&node)
+        self.intern_node(&node)
     }
 
     pub fn create_region(&mut self, controls: &[NodeId]) -> NodeId {
         let mut node = Node::new(NodeKind::Region, Type::Control);
         node.set_inputs(controls);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.seal(id);
         id
     }
@@ -594,7 +594,7 @@ impl IRBuilder {
     pub fn create_param(&mut self, index: usize, t: Type) -> Node {
         let mut param_node = Node::new(NodeKind::Param, t.clone());
         param_node.data.param_index = index;
-        let param_id = self.push_node(&param_node);
+        let param_id = self.intern_node(&param_node);
 
         let mut identity = Node::new(NodeKind::Identity, t);
         identity.data.identity_id = param_id;
@@ -630,7 +630,7 @@ impl IRBuilder {
         let control = self.current_control;
         let mut node = Node::new(NodeKind::New, alloc_type);
         node.set_inputs(&[control, mem]);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.variables[MEMORY_VAR.as_usize()]
             .current_def
             .insert(control, id);
@@ -648,7 +648,7 @@ impl IRBuilder {
         let control = self.current_control;
         let mut node = Node::new(NodeKind::Load, loaded_type);
         node.set_inputs(&[control, mem, ptr]);
-        self.push_node(&node)
+        self.intern_node(&node)
     }
 
     /// Create a Store (memory write) node.
@@ -656,7 +656,7 @@ impl IRBuilder {
         let control = self.current_control;
         let mut node = Node::new(NodeKind::Store, Type::Memory);
         node.set_inputs(&[control, mem, ptr, value]);
-        let id = self.push_node(&node);
+        let id = self.intern_node(&node);
         self.variables[MEMORY_VAR.as_usize()]
             .current_def
             .insert(control, id);
@@ -722,19 +722,7 @@ impl IRBuilder {
             Some(node) => {
                 let new_id = match node.get_identity_id() {
                     Some(id) => id,
-                    None if node.kind.is_pure() => self.push_node(&node),
-                    None => {
-                        // Non-pure, non-Identity result: creator short-circuited to one of
-                        // its operands (e.g. 0 + y → y where y is a raw Param).
-                        // Find the matching input ID by comparing nodes.
-                        let found = inputs.iter().copied().find(|&id| {
-                            id.is_valid() && *self.lookup_node(id) == node
-                        });
-                        match found {
-                            Some(id) => id,
-                            None => return None,
-                        }
-                    }
+                    None => self.intern_node(&node),
                 };
                 if new_id != slot {
                     Some(new_id)

@@ -338,7 +338,7 @@ fn test_outputs_tracking() {
     // Create param (node 2) and const (node 3)
     let x = builder.create_param(0, Type::I32);
     let c = Node::const_int(5);
-    let c_id = builder.push_node(&c);
+    let c_id = builder.intern_node(&c);
 
     // Add: node 4 = x + c (inputs: 0, x_id, c_id)
     let add_result = builder.create_add(&x, &c).unwrap();
@@ -372,7 +372,7 @@ fn test_replace_node_outputs() {
 
     let x = builder.create_param(0, Type::I32);
     let c = Node::const_int(5);
-    let c_id = builder.push_node(&c);
+    let c_id = builder.intern_node(&c);
 
     // add1: x + 5
     let add1 = builder.create_add(&x, &c).unwrap();
@@ -423,7 +423,7 @@ fn test_ssa_single_block_read_write() {
 
     let v = builder.create_variable("x");
     let one = Node::const_int(1);
-    let one_id = builder.push_node(&one);
+    let one_id = builder.intern_node(&one);
 
     // Write x = 1 at Entry
     builder.write_variable(v, one_id);
@@ -440,8 +440,8 @@ fn test_ssa_overwrite_within_block() {
     let v = builder.create_variable("x");
     let one = Node::const_int(1);
     let two = Node::const_int(2);
-    let one_id = builder.push_node(&one);
-    let two_id = builder.push_node(&two);
+    let one_id = builder.intern_node(&one);
+    let two_id = builder.intern_node(&two);
 
     // Write x = 1, then overwrite with x = 2
     builder.write_variable(v, one_id);
@@ -457,7 +457,7 @@ fn test_ssa_single_predecessor_chain() {
 
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
-    let five_id = builder.push_node(&five);
+    let five_id = builder.intern_node(&five);
 
     // Write x = 5 at Entry
     builder.write_variable(v, five_id);
@@ -480,12 +480,12 @@ fn test_ssa_if_else_phi_insertion() {
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
     let ten = Node::const_int(10);
-    let five_id = builder.push_node(&five);
-    let ten_id = builder.push_node(&ten);
+    let five_id = builder.intern_node(&five);
+    let ten_id = builder.intern_node(&ten);
 
     // Create control flow: Entry -> If -> Then/Else -> Region
     let cond_true = Node::const_bool(true);
-    let _cond_id = builder.push_node(&cond_true);
+    let _cond_id = builder.intern_node(&cond_true);
     let if_node = builder.create_if(NodeId(1), &cond_true);
     let then_ctrl = builder.create_then(if_node);
     let else_ctrl = builder.create_else(if_node);
@@ -529,7 +529,7 @@ fn test_ssa_trivial_phi_elimination() {
 
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
-    let five_id = builder.push_node(&five);
+    let five_id = builder.intern_node(&five);
 
     // Entry -> If -> Then/Else -> Region
     // Both branches write x = 5 (same value)
@@ -559,7 +559,7 @@ fn test_ssa_phi_non_branching_region() {
 
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
-    let five_id = builder.push_node(&five);
+    let five_id = builder.intern_node(&five);
 
     builder.write_variable(v, five_id);
 
@@ -581,9 +581,9 @@ fn test_ssa_nested_if_else() {
     let one = Node::const_int(1);
     let two = Node::const_int(2);
     let three = Node::const_int(3);
-    let one_id = builder.push_node(&one);
-    let two_id = builder.push_node(&two);
-    let three_id = builder.push_node(&three);
+    let one_id = builder.intern_node(&one);
+    let two_id = builder.intern_node(&two);
+    let three_id = builder.intern_node(&three);
 
     let cond = Node::const_bool(true);
 
@@ -642,8 +642,8 @@ fn test_ssa_incomplete_phi_on_seal() {
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
     let ten = Node::const_int(10);
-    let five_id = builder.push_node(&five);
-    let ten_id = builder.push_node(&ten);
+    let five_id = builder.intern_node(&five);
+    let ten_id = builder.intern_node(&ten);
 
     // Manually set up: Entry -> Region (with seal deferred)
     // We'll create a Loop (not auto-sealed) to simulate incomplete CFG
@@ -680,7 +680,7 @@ fn test_ssa_chained_trivial_phi_elimination() {
     let v0 = builder.create_variable("a");
     let v1 = builder.create_variable("b");
     let five = Node::const_int(5);
-    let five_id = builder.push_node(&five);
+    let five_id = builder.intern_node(&five);
 
     // Create: Entry -> Region1 -> Region2
     // Write a = 5 at Entry
@@ -731,7 +731,7 @@ fn test_ssa_replace_all_uses() {
     // Create: param + const, then x = add(param, const)
     let x = builder.create_param(0, Type::I32);
     let c = Node::const_int(5);
-    let c_id = builder.push_node(&c);
+    let c_id = builder.intern_node(&c);
     let add = builder.create_add(&x, &c).unwrap();
     let add_id = builder.get_node_id(&add);
 
@@ -740,7 +740,7 @@ fn test_ssa_replace_all_uses() {
 
     // Replace all uses of c (const 5) with another const
     let new_c = Node::const_int(10);
-    let new_c_id = builder.push_node(&new_c);
+    let new_c_id = builder.intern_node(&new_c);
     builder.replace_all_uses(c_id, new_c_id);
 
     // Old c has no users
@@ -767,10 +767,10 @@ fn test_ssa_multiple_vars_at_merge() {
     let two = Node::const_int(2);
     let three = Node::const_int(3);
     let four = Node::const_int(4);
-    let one_id = builder.push_node(&one);
-    let two_id = builder.push_node(&two);
-    let three_id = builder.push_node(&three);
-    let four_id = builder.push_node(&four);
+    let one_id = builder.intern_node(&one);
+    let two_id = builder.intern_node(&two);
+    let three_id = builder.intern_node(&three);
+    let four_id = builder.intern_node(&four);
 
     let cond = Node::const_bool(true);
     let if_node = builder.create_if(NodeId(1), &cond);
@@ -818,8 +818,8 @@ fn test_ssa_partial_definition_at_merge() {
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
     let ten = Node::const_int(10);
-    let five_id = builder.push_node(&five);
-    let ten_id = builder.push_node(&ten);
+    let five_id = builder.intern_node(&five);
+    let ten_id = builder.intern_node(&ten);
 
     // Write x = 5 at Entry
     builder.write_variable(v, five_id);
@@ -892,7 +892,7 @@ fn test_ssa_seal_with_no_incomplete_phis() {
     // Read a variable that has a def at Entry — should work through region
     let v = builder.create_variable("x");
     let five = Node::const_int(5);
-    let five_id = builder.push_node(&five);
+    let five_id = builder.intern_node(&five);
     builder.write_variable(v, five_id);
 
     builder.set_control(region);
@@ -907,7 +907,7 @@ fn test_ssa_replace_all_uses_cleans_up_inputs() {
     let x = builder.create_param(0, Type::I32);
     let _x_id = x.get_identity_id().unwrap();
     let c = Node::const_int(5);
-    let c_id = builder.push_node(&c);
+    let c_id = builder.intern_node(&c);
 
     // add uses both x and c
     let add = builder.create_add(&x, &c).unwrap();
@@ -919,7 +919,7 @@ fn test_ssa_replace_all_uses_cleans_up_inputs() {
     // c is an input of add, so add's input list includes c_id
     // Now replace all uses of c
     let new_c = Node::const_int(10);
-    let new_c_id = builder.push_node(&new_c);
+    let new_c_id = builder.intern_node(&new_c);
     builder.replace_all_uses(c_id, new_c_id);
 
     // c should no longer have add as a user (stale edge cleaned up)
@@ -1009,7 +1009,7 @@ fn test_memory_store_creates_node_and_updates_chain() {
 
     // Store: write a value into the allocated object
     let val = Node::const_int(42);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let current_mem = builder.get_current_memory(); // Should be New
     let store_id = builder.create_store(current_mem, ptr, val_id);
 
@@ -1066,7 +1066,7 @@ fn test_memory_chain_new_then_store_then_load() {
     let ptr = builder.create_new(mem_root, obj_type);
     let store_mem = builder.get_current_memory(); // should be New
     let val = Node::const_int(99);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store_id = builder.create_store(store_mem, ptr, val_id);
 
     // Now load: uses Store's memory state — Load-Store forwarding returns val_id directly
@@ -1104,7 +1104,7 @@ fn test_memory_phi_at_merge() {
     assert_eq!(then_mem, mem_root);
     let ptr_then = builder.create_new(then_mem, obj_type.clone());
     let val1 = Node::const_int(1);
-    let val1_id = builder.push_node(&val1);
+    let val1_id = builder.intern_node(&val1);
     let then_before_store = builder.get_current_memory();
     builder.create_store(then_before_store, ptr_then, val1_id);
     let then_final_mem = builder.get_current_memory(); // the Store
@@ -1115,7 +1115,7 @@ fn test_memory_phi_at_merge() {
     assert_eq!(else_mem, mem_root);
     let ptr_else = builder.create_new(else_mem, obj_type);
     let val2 = Node::const_int(2);
-    let val2_id = builder.push_node(&val2);
+    let val2_id = builder.intern_node(&val2);
     let else_before_store = builder.get_current_memory();
     builder.create_store(else_before_store, ptr_else, val2_id);
     let else_final_mem = builder.get_current_memory(); // the Store
@@ -1220,7 +1220,7 @@ fn test_memory_load_after_store_reads_same() {
     // Allocate, store x=42, then load x
     let ptr = builder.create_new(mem, point_type);
     let val = Node::const_int(42);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store_before = builder.get_current_memory();
     let store_mem = builder.create_store(store_before, ptr, val_id);
 
@@ -1268,7 +1268,7 @@ fn test_memory_load_store_forwarding() {
     let ptr = builder.create_new(mem, obj_type);
     let store_before = builder.get_current_memory();
     let val = Node::const_int(42);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store = builder.create_store(store_before, ptr, val_id);
 
     // Load from same ptr using Store as memory → should forward to val_id
@@ -1308,7 +1308,7 @@ fn test_memory_load_store_diff_ptr_no_forward() {
 
     // Store to ptr1
     let val = Node::const_int(7);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store_before = builder.get_current_memory();
     let store = builder.create_store(store_before, ptr1, val_id);
 
@@ -1336,12 +1336,12 @@ fn test_memory_load_forward_from_last_store() {
 
     // First store: x = 7
     let val1 = Node::const_int(7);
-    let val1_id = builder.push_node(&val1);
+    let val1_id = builder.intern_node(&val1);
     let store1 = builder.create_store(mem_after_new, ptr, val1_id);
 
     // Second store: x = 99 (overwrites)
     let val2 = Node::const_int(99);
-    let val2_id = builder.push_node(&val2);
+    let val2_id = builder.intern_node(&val2);
     let store2 = builder.create_store(store1, ptr, val2_id);
 
     // Load — should forward to 99 (the last store's value)
@@ -1371,7 +1371,7 @@ fn test_memory_load_store_via_phi_no_forward() {
     let ptr = builder.create_new(mem, obj_type.clone());
     let then_mem_after_new = builder.get_current_memory();
     let val = Node::const_int(10);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let then_store = builder.create_store(then_mem_after_new, ptr, val_id);
 
     // Else: just allocate (no store), different ptr
@@ -1405,7 +1405,7 @@ fn test_memory_load_store_skips_output_edges() {
     let ptr = builder.create_new(mem, obj_type);
     let store_before = builder.get_current_memory();
     let val = Node::const_int(42);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store = builder.create_store(store_before, ptr, val_id);
 
     // Track outputs of Store and value before Load
@@ -1454,7 +1454,7 @@ fn test_memory_output_tracking() {
     // Now current memory is the 2nd New (ptr2). The store will write to ptr.
     let store_mem = builder.get_current_memory(); // 2nd New
     let val = Node::const_int(7);
-    let val_id = builder.push_node(&val);
+    let val_id = builder.intern_node(&val);
     let store = builder.create_store(store_mem, ptr, val_id);
 
     // New (ptr) should have Store as a user (ptr is the first New)
@@ -1478,7 +1478,7 @@ fn test_worklist_reidealizes_on_input_change() {
     let x = builder.create_param(0, Type::I32);
     let c = Node::const_int(5);
     let _zero = Node::const_int(0);
-    let c_id = builder.push_node(&c);
+    let c_id = builder.intern_node(&c);
     let x_id = x.get_identity_id().unwrap();
 
     // Create Sub(x, 5) → should stay as Sub (not simplified further)
@@ -1510,8 +1510,8 @@ fn test_worklist_chain_reidealizes() {
     let y = builder.create_param(1, Type::I32);
     let c = Node::const_int(5);
     let ten = Node::const_int(10);
-    let c_id = builder.push_node(&c);
-    let ten_id = builder.push_node(&ten);
+    let c_id = builder.intern_node(&c);
+    let ten_id = builder.intern_node(&ten);
     let x_id = x.get_identity_id().unwrap();
     let _y_id = y.get_identity_id().unwrap();
 
