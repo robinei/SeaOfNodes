@@ -106,11 +106,13 @@ pub enum NodeKind {
     Then,   // Then branch projection. Inputs: control (if)
     Else,   // Else branch projection. Inputs: control (if)
     Region, // Control merge node. Inputs: control per predecessor
+    #[allow(dead_code)]
     Loop,   // Special control merge node for loops. Inputs: control per predecessor
 
     // Memory nodes
     Memory, // Initial mem state. Root of all mem chains. Value is mem. Inputs: none
     New,    // Allocate new object of type matching node type. Value is ptr. Inputs: mem
+    #[allow(dead_code)]
     Load,   // Load from ptr. Value is loaded data, but can polymorphically act as mem. Inputs: mem, ptr (from New), offset
     Store,  // Store to ptr. Value is mem. Inputs: mem, ptr (from New), value
 
@@ -123,10 +125,13 @@ pub enum NodeKind {
     Add,
     Sub,
     Mul,
+    #[allow(dead_code)]
     Div,
 
     // Cast operations — inputs: control, value
+    #[allow(dead_code)]
     StaticCast,  // Safe cast, no runtime check needed
+    #[allow(dead_code)]
     DynamicCast, // Cast requiring runtime type check
 }
 
@@ -233,6 +238,7 @@ impl Node {
 
     /// Control dependency (index 0). Valid for all control-dependent nodes.
     #[inline]
+    #[allow(dead_code)]
     pub fn ctrl(&self) -> NodeId {
         self.get_input(0)
     }
@@ -259,6 +265,7 @@ impl Node {
 
     /// Memory chain input (New, Load, Store).
     #[inline]
+    #[allow(dead_code)]
     pub fn memory(&self) -> NodeId {
         debug_assert!(matches!(self.kind, NodeKind::New | NodeKind::Load | NodeKind::Store));
         self.get_input(1)
@@ -266,6 +273,7 @@ impl Node {
 
     /// Pointer operand (Load, Store).
     #[inline]
+    #[allow(dead_code)]
     pub fn ptr(&self) -> NodeId {
         debug_assert!(matches!(self.kind, NodeKind::Load | NodeKind::Store));
         self.get_input(2)
@@ -273,6 +281,7 @@ impl Node {
 
     /// Value being stored (Store only).
     #[inline]
+    #[allow(dead_code)]
     pub fn store_value(&self) -> NodeId {
         debug_assert_eq!(self.kind, NodeKind::Store);
         self.get_input(3)
@@ -298,6 +307,7 @@ impl Node {
 
     /// Control region merge point (Phi).
     #[inline]
+    #[allow(dead_code)]
     pub fn region(&self) -> NodeId {
         debug_assert_eq!(self.kind, NodeKind::Phi);
         self.get_input(0)

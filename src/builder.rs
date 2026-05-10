@@ -52,6 +52,7 @@ impl IRBuilder {
     }
 }
 
+#[allow(dead_code)]
 impl IRBuilder {
     pub fn new() -> Self {
         // Create initial nodes: node 0 = Unreachable, node 1 = Entry, node 2 = Memory

@@ -26,6 +26,7 @@ pub trait CompactVecState: Copy + Clone {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompactVecStateU8(u8);
 
@@ -76,6 +77,7 @@ impl CompactVecState for CompactVecStateU16 {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompactVecStateU32(u32);
 
@@ -464,6 +466,7 @@ impl<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize>
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn set(&mut self, index: usize, item: u32) {
         self.data.set(&mut self.state, index, item)
     }
@@ -487,6 +490,7 @@ impl<const MAX_U8: usize, const MAX_U16: usize, const MAX_U32: usize>
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn storage_type(&self) -> StorageType {
         self.state.storage_type()
     }

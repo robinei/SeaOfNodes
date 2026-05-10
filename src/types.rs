@@ -7,6 +7,7 @@ use crate::constraints::*;
 use crate::symbols::SymbolId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum CastKind {
     Static,  // Guaranteed safe, no runtime check needed
     Dynamic, // Possible but requires runtime type check
@@ -30,6 +31,7 @@ enum ArithmeticOp {
     Add,
     Sub,
     Mul,
+    #[allow(dead_code)]
     Div,
 }
 
@@ -95,18 +97,19 @@ pub enum Type {
     Float(FloatConstraint),
     Type(TypeConstraint),
 
+    #[allow(dead_code)]
     Fun(Arc<FunInfo>),
 
     Data(Option<SymbolId>, Arc<[DataField]>), // tag, fields
 
     Union(Arc<[Type]>, Priv),
 
+    #[allow(dead_code)]
     Error(Arc<Type>, Priv),
 }
 
+#[allow(dead_code)]
 impl Type {
-    #[allow(dead_code)]
-    pub const UNIT: Type = Type::Unit;
     #[allow(dead_code)]
     pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
     #[allow(dead_code)]
@@ -123,7 +126,10 @@ impl Type {
     pub const U32: Type = Type::prim_uint(UIntPrim::U32);
     #[allow(dead_code)]
     pub const U64: Type = Type::prim_uint(UIntPrim::U64);
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
+    #[allow(dead_code)]
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
 
     /// Generic helper for binary arithmetic operations
@@ -983,6 +989,7 @@ impl Type {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeConstraint {
     Any,
+    #[allow(dead_code)]
     Const(Arc<Type>),
 }
 

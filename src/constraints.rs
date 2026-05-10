@@ -494,12 +494,14 @@ pub type IntConstraint = RangeConstraint<i64>;
 pub type UIntConstraint = RangeConstraint<u64>;
 
 // Common range type for comparison across signed/unsigned boundaries
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CommonRange {
     pub min: i128,
     pub max: i128,
 }
 
+#[allow(dead_code)]
 impl CommonRange {
     pub fn new(min: i128, max: i128) -> Self {
         Self { min, max }
