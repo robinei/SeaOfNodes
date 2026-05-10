@@ -133,13 +133,9 @@ impl IRBuilder {
         }
 
         // Remove old_id from its inputs' output lists (stale edge cleanup)
-        let inputs: Vec<NodeId> = {
-            let old_node = &self.nodes[old_id.as_usize()];
-            (0..old_node.inputs_len())
-                .map(|i| old_node.get_input(i))
-                .collect()
-        };
-        for &input in &inputs {
+        let ninputs = self.nodes[old_id.as_usize()].inputs_len();
+        for i in 0..ninputs {
+            let input = self.nodes[old_id.as_usize()].get_input(i);
             if input.is_valid() {
                 let outputs = &mut self.node_outputs[input.as_usize()];
                 if let Some(pos) = outputs.iter().position(|x| x == old_id.0) {
@@ -149,19 +145,15 @@ impl IRBuilder {
         }
 
         // Snapshot old outputs, then clear the old node's output list
-        // Also check which users are pure before loop (avoids borrow conflicts)
         let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()]
             .iter()
             .map(|x| NodeId(x))
             .collect();
-        let pure_users: Vec<bool> = old_outputs
-            .iter()
-            .map(|&id| self.nodes[id.as_usize()].kind.is_pure())
-            .collect();
         self.node_outputs[old_id.as_usize()].set_all(&[]);
 
         // Rewire each old user to point to new_id instead of old_id
-        for (i, &user_id) in old_outputs.iter().enumerate() {
+        for &user_id in &old_outputs {
+            let kind = self.nodes[user_id.as_usize()].kind;
             let user = &mut self.nodes[user_id.as_usize()];
             for j in 0..user.inputs_len() {
                 if user.get_input(j) == old_id {
@@ -172,7 +164,7 @@ impl IRBuilder {
             self.node_outputs[new_id.as_usize()].push(user_id.0);
 
             // Schedule re-idealization for pure users whose input changed
-            if pure_users[i] {
+            if kind.is_pure() {
                 self.worklist.push(user_id);
             }
         }
@@ -685,34 +677,32 @@ impl IRBuilder {
     /// Returns `Some(new_id)` if the node was simplified to a different existing node,
     /// or `None` if it's already ideal.
     fn idealize(&mut self, slot: NodeId) -> Option<NodeId> {
-        // Snapshot kind and inputs to avoid borrow conflicts with self.create_* calls
-        let (kind, inputs): (NodeKind, Vec<NodeId>) = {
+        let (kind, lhs, rhs): (NodeKind, NodeId, NodeId) = {
             let node = &self.nodes[slot.as_usize()];
-            let inputs = (0..node.inputs_len())
-                .map(|i| node.get_input(i))
-                .collect();
-            (node.kind, inputs)
+            let lhs = if node.inputs_len() > 1 { node.get_input(1) } else { NodeId(0) };
+            let rhs = if node.inputs_len() > 2 { node.get_input(2) } else { NodeId(0) };
+            (node.kind, lhs, rhs)
         };
 
         let result = match kind {
             NodeKind::Add => {
-                let lhs = self.wrap_for_creator(inputs[1]);
-                let rhs = self.wrap_for_creator(inputs[2]);
+                let lhs = self.wrap_for_creator(lhs);
+                let rhs = self.wrap_for_creator(rhs);
                 self.create_add(&lhs, &rhs).ok()
             }
             NodeKind::Sub => {
-                let lhs = self.wrap_for_creator(inputs[1]);
-                let rhs = self.wrap_for_creator(inputs[2]);
+                let lhs = self.wrap_for_creator(lhs);
+                let rhs = self.wrap_for_creator(rhs);
                 self.create_sub(&lhs, &rhs).ok()
             }
             NodeKind::Mul => {
-                let lhs = self.wrap_for_creator(inputs[1]);
-                let rhs = self.wrap_for_creator(inputs[2]);
+                let lhs = self.wrap_for_creator(lhs);
+                let rhs = self.wrap_for_creator(rhs);
                 self.create_mul(&lhs, &rhs).ok()
             }
             NodeKind::Div => {
-                let lhs = self.wrap_for_creator(inputs[1]);
-                let rhs = self.wrap_for_creator(inputs[2]);
+                let lhs = self.wrap_for_creator(lhs);
+                let rhs = self.wrap_for_creator(rhs);
                 self.create_div(&lhs, &rhs).ok()
             }
             _ => None,
