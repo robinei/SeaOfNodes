@@ -13,6 +13,8 @@ separate passes.
   say to go ahead (e.g., "implement it", "let's do it", "sounds good, build it").
   Discussion and planning are separate from implementation.
 - **Always commit after implementing.** Once you finish writing code (and tests pass), commit immediately unless I explicitly tell you not to. Do not move on to another task or wait to be reminded — committing is part of finishing the implementation.
+  - **Amend** the last commit if the change is obviously a fix to that commit (typo fix, missed edge case, test fix) or if I explicitly ask to amend.
+  - Otherwise, create a **new commit**.
 - **Update PLAN.md if needed after finishing work.** After implementing and committing, review whether the completed task should be marked done, reprioritized, or removed from the roadmap. Keep PLAN.md in sync with actual project state.
 
 ## What We Value
