@@ -116,6 +116,7 @@ pub enum NodeKind {
 
     // Unary operations — inputs: value
     Neg,
+    #[allow(dead_code)]
     Not,
 
     // Binary operations — inputs: lhs, rhs
@@ -289,6 +290,7 @@ impl Node {
 
     /// Condition operand (If).
     #[inline]
+    #[allow(dead_code)]
     pub fn predicate(&self) -> NodeId {
         debug_assert_eq!(self.kind, NodeKind::If);
         self.get_input(1)

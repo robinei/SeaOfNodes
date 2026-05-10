@@ -41,6 +41,7 @@ pub struct DataField {
 
 #[derive(Debug, Clone)]
 pub struct FunParam {
+    #[allow(dead_code)]
     pub name: SymbolId, // Parameter name for documentation/errors
     pub ty: Type,       // Parameter type
 }
@@ -104,15 +105,23 @@ pub enum Type {
 }
 
 impl Type {
+    #[allow(dead_code)]
     pub const UNIT: Type = Type::Unit;
+    #[allow(dead_code)]
     pub const BOOL: Type = Type::Bool(BoolConstraint::Any);
+    #[allow(dead_code)]
     pub const I8: Type = Type::prim_int(IntPrim::I8);
+    #[allow(dead_code)]
     pub const I16: Type = Type::prim_int(IntPrim::I16);
     pub const I32: Type = Type::prim_int(IntPrim::I32);
     pub const I64: Type = Type::prim_int(IntPrim::I64);
+    #[allow(dead_code)]
     pub const U8: Type = Type::prim_uint(UIntPrim::U8);
+    #[allow(dead_code)]
     pub const U16: Type = Type::prim_uint(UIntPrim::U16);
+    #[allow(dead_code)]
     pub const U32: Type = Type::prim_uint(UIntPrim::U32);
+    #[allow(dead_code)]
     pub const U64: Type = Type::prim_uint(UIntPrim::U64);
     pub const F32: Type = Type::Float(FloatConstraint::Any(FloatPrim::F32));
     pub const F64: Type = Type::Float(FloatConstraint::Any(FloatPrim::F64));
@@ -642,6 +651,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn bool_from_option(result: Option<bool>) -> Type {
         match result {
             Some(value) => Type::const_bool(value),
@@ -650,6 +660,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn compare(&self, other: &Self, op: CompareOp) -> Result<Type, IRError> {
         match (self, other) {
             (Type::Bool(lc), Type::Bool(rc)) => Ok(Type::bool_from_option(lc.compare(*rc, op))),
@@ -675,26 +686,32 @@ impl Type {
         }
     }
 
+    #[allow(dead_code)]
     pub fn eq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Eq)
     }
 
+    #[allow(dead_code)]
     pub fn neq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Neq)
     }
 
+    #[allow(dead_code)]
     pub fn lt(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Lt)
     }
 
+    #[allow(dead_code)]
     pub fn gt(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::Gt)
     }
 
+    #[allow(dead_code)]
     pub fn lteq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::LtEq)
     }
 
+    #[allow(dead_code)]
     pub fn gteq(&self, other: &Self) -> Result<Type, IRError> {
         self.compare(other, CompareOp::GtEq)
     }
@@ -735,6 +752,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub const fn prim_uint(prim: UIntPrim) -> Self {
         Type::UInt(prim, UIntConstraint::new(prim.min(), prim.max()))
     }
@@ -774,6 +792,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn get_const_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(c) => c.get_const_value(),
@@ -790,6 +809,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn get_const_uint(&self) -> Option<u64> {
         match self {
             Self::UInt(_, c) => c.get_const_value(),
@@ -806,6 +826,7 @@ impl Type {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn get_const_type(&self) -> Option<Arc<Type>> {
         match self {
             Self::Type(c) => c.get_const_value(),
@@ -971,6 +992,7 @@ impl TypeConstraint {
         return matches!(self, TypeConstraint::Const(..));
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn get_const_value(&self) -> Option<Arc<Type>> {
         match self {
@@ -979,6 +1001,7 @@ impl TypeConstraint {
         }
     }
 
+    #[allow(dead_code)]
     pub fn compare(&self, other: &Self, op: CompareOp) -> Option<bool> {
         match (self, other) {
             (TypeConstraint::Const(a), TypeConstraint::Const(b)) => Some(match op {

@@ -2,6 +2,7 @@ use crate::node::IRError;
 use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
 use ordered_float::OrderedFloat;
 
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntPrim {
@@ -11,6 +12,7 @@ pub enum IntPrim {
     I64,
 }
 
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UIntPrim {
@@ -67,6 +69,7 @@ impl UIntPrim {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum CompareOp {
     Lt,   // <
@@ -97,6 +100,7 @@ pub trait ConstraintValue:
     fn prim_max(prim: Self::Primitive) -> Self;
 
     // Check if this primitive can represent untyped constants
+    #[allow(dead_code)]
     fn is_const_storage(prim: Self::Primitive) -> bool;
 }
 
@@ -291,6 +295,7 @@ impl<T: ConstraintValue> RangeConstraint<T> {
         })
     }
 
+    #[allow(dead_code)]
     pub fn compare(self, other: Self, op: CompareOp) -> Option<bool> {
         match op {
             CompareOp::Lt => {
@@ -367,6 +372,7 @@ impl BoolConstraint {
         return matches!(self, BoolConstraint::Const(..));
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn get_const_value(&self) -> Option<bool> {
         match self {
@@ -375,6 +381,7 @@ impl BoolConstraint {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn combine(self, other: Self, op: impl FnOnce(bool, bool) -> bool) -> Self {
         match (self, other) {
@@ -385,11 +392,13 @@ impl BoolConstraint {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn and(self, other: Self) -> Self {
         self.combine(other, |lval, rval| lval && rval)
     }
 
+    #[allow(dead_code)]
     pub fn compare(self, other: Self, op: CompareOp) -> Option<bool> {
         match (self, other) {
             (BoolConstraint::Const(a), BoolConstraint::Const(b)) => Some(match op {
@@ -464,6 +473,7 @@ impl FloatConstraint {
         self.combine(other, |lval, rval| lval / rval)
     }
 
+    #[allow(dead_code)]
     pub fn compare(self, other: Self, op: CompareOp) -> Option<bool> {
         match (self, other) {
             (FloatConstraint::Const(a), FloatConstraint::Const(b)) => Some(match op {

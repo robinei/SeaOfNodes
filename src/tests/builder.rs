@@ -1310,7 +1310,7 @@ fn test_memory_load_store_diff_ptr_no_forward() {
     let val = Node::const_int(7);
     let val_id = builder.intern_node(&val);
     let store_before = builder.get_current_memory();
-    let store = builder.create_store(store_before, ptr1, val_id);
+    let _store = builder.create_store(store_before, ptr1, val_id);
 
     // Load from ptr2 (different ptr) — should NOT forward
     let mem_after_store = builder.get_current_memory();
@@ -1372,12 +1372,12 @@ fn test_memory_load_store_via_phi_no_forward() {
     let then_mem_after_new = builder.get_current_memory();
     let val = Node::const_int(10);
     let val_id = builder.intern_node(&val);
-    let then_store = builder.create_store(then_mem_after_new, ptr, val_id);
+    let _then_store = builder.create_store(then_mem_after_new, ptr, val_id);
 
     // Else: just allocate (no store), different ptr
     builder.set_control(else_ctrl);
     let _ptr_else = builder.create_new(mem, obj_type);
-    let else_mem = builder.get_current_memory();
+    let _else_mem = builder.get_current_memory();
 
     // Merge at Region — memory Phi merges Store and New
     let region = builder.create_region(&[then_ctrl, else_ctrl]);
