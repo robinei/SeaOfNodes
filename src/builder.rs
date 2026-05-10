@@ -145,14 +145,12 @@ impl IRBuilder {
         }
 
         // Snapshot old outputs, then clear the old node's output list
-        let old_outputs: Vec<NodeId> = self.node_outputs[old_id.as_usize()]
-            .iter()
-            .map(|x| NodeId(x))
-            .collect();
+        let old_outputs = self.node_outputs[old_id.as_usize()].clone();
         self.node_outputs[old_id.as_usize()].set_all(&[]);
 
         // Rewire each old user to point to new_id instead of old_id
-        for &user_id in &old_outputs {
+        for idx in 0..old_outputs.len() {
+            let user_id = NodeId(old_outputs.get(idx));
             let kind = self.nodes[user_id.as_usize()].kind;
             let user = &mut self.nodes[user_id.as_usize()];
             for j in 0..user.inputs_len() {
@@ -235,7 +233,7 @@ impl IRBuilder {
         }
         if preds.len() == 1 {
             // Single predecessor: just recurse, no Phi needed
-            let val = self.lookup_variable(var, preds[0]);
+            let val = self.lookup_variable(var, NodeId(preds.get(0)));
             self.variables[var.as_usize()].current_def.insert(ctrl, val);
             return val;
         }
@@ -254,7 +252,8 @@ impl IRBuilder {
     fn add_phi_operands(&mut self, var: VarId, phi_id: NodeId, ctrl: NodeId) -> NodeId {
         let preds = self.get_control_predecessors(ctrl);
         let mut operand_types: Vec<Type> = Vec::new();
-        for &pred in &preds {
+        for raw in preds.iter() {
+            let pred = NodeId(raw);
             let val = self.lookup_variable(var, pred);
             // Append operand to Phi
             self.nodes[phi_id.as_usize()].push_input(val);
@@ -302,16 +301,14 @@ impl IRBuilder {
         };
 
         // Snapshot phi's users before rerouting
-        let phi_users: Vec<NodeId> = self.node_outputs[phi_id.as_usize()]
-            .iter()
-            .map(|x| NodeId(x))
-            .collect();
+        let phi_users = self.node_outputs[phi_id.as_usize()].clone();
 
         // Reroute all uses of phi to replacement
         self.replace_all_uses(phi_id, replacement);
 
         // Recursively check Phi users that might have become trivial
-        for &user_id in &phi_users {
+        for idx in 0..phi_users.len() {
+            let user_id = NodeId(phi_users.get(idx));
             if user_id != phi_id {
                 let kind = self.nodes[user_id.as_usize()].kind;
                 if kind == NodeKind::Phi {
@@ -339,25 +336,25 @@ impl IRBuilder {
     }
 
     /// Get the control predecessors of a control node.
-    fn get_control_predecessors(&self, ctrl: NodeId) -> Vec<NodeId> {
+    fn get_control_predecessors(&self, ctrl: NodeId) -> OutputsVec {
+        let mut preds = OutputsVec::new();
         match self.nodes[ctrl.as_usize()].kind {
             NodeKind::Region | NodeKind::Loop => {
                 // All inputs are control predecessors
                 let n = self.nodes[ctrl.as_usize()].inputs_len();
-                (0..n)
-                    .map(|i| self.nodes[ctrl.as_usize()].get_input(i))
-                    .collect()
+                for i in 0..n {
+                    preds.push(self.nodes[ctrl.as_usize()].get_input(i).0);
+                }
             }
-            NodeKind::Entry => vec![],
+            NodeKind::Entry => {}
             _ => {
                 // For non-merge control nodes, the single control input at index 0
                 if self.nodes[ctrl.as_usize()].inputs_len() > 0 {
-                    vec![self.nodes[ctrl.as_usize()].get_input(0)]
-                } else {
-                    vec![]
+                    preds.push(self.nodes[ctrl.as_usize()].get_input(0).0);
                 }
             }
         }
+        preds
     }
 
     /// Add a new predecessor to a Loop node (for back-edges).
