@@ -137,6 +137,13 @@ impl NodeKind {
             Const | Neg | Not | Add | Sub | Mul | Div | StaticCast | DynamicCast
         )
     }
+
+    /// Returns true for node kinds whose value might simplify when their inputs change.
+    /// This includes pure nodes (peepholes, constant folding) and Phis (trivial elimination).
+    /// These are the kinds that get enqueued on the worklist in replace_all_uses.
+    pub fn can_idealize(self) -> bool {
+        self.is_pure() || self == NodeKind::Phi
+    }
 }
 
 // ── NodeData (union) ──
@@ -217,6 +224,81 @@ impl Node {
     #[inline]
     pub fn get_input(&self, index: usize) -> NodeId {
         NodeId(unsafe { self.data.inputs.get(&self.inputs_state, index) })
+    }
+
+    // ── Named accessors ──
+    // Every node that depends on control stores it at index 0.
+    // Kind-specific operands start at index 1.
+
+    /// Control dependency (index 0). Valid for all control-dependent nodes.
+    #[inline]
+    pub fn ctrl(&self) -> NodeId {
+        self.get_input(0)
+    }
+
+    /// Left-hand side of a binary operation (Add, Sub, Mul, Div).
+    #[inline]
+    pub fn lhs(&self) -> NodeId {
+        debug_assert!(matches!(
+            self.kind,
+            NodeKind::Add | NodeKind::Sub | NodeKind::Mul | NodeKind::Div
+        ));
+        self.get_input(1)
+    }
+
+    /// Right-hand side of a binary operation (Add, Sub, Mul, Div).
+    #[inline]
+    pub fn rhs(&self) -> NodeId {
+        debug_assert!(matches!(
+            self.kind,
+            NodeKind::Add | NodeKind::Sub | NodeKind::Mul | NodeKind::Div
+        ));
+        self.get_input(2)
+    }
+
+    /// Memory chain input (New, Load, Store).
+    #[inline]
+    pub fn memory(&self) -> NodeId {
+        debug_assert!(matches!(self.kind, NodeKind::New | NodeKind::Load | NodeKind::Store));
+        self.get_input(1)
+    }
+
+    /// Pointer operand (Load, Store).
+    #[inline]
+    pub fn ptr(&self) -> NodeId {
+        debug_assert!(matches!(self.kind, NodeKind::Load | NodeKind::Store));
+        self.get_input(2)
+    }
+
+    /// Value being stored (Store only).
+    #[inline]
+    pub fn store_value(&self) -> NodeId {
+        debug_assert_eq!(self.kind, NodeKind::Store);
+        self.get_input(3)
+    }
+
+    /// Single value operand (Neg, Not, StaticCast, DynamicCast).
+    #[inline]
+    pub fn value(&self) -> NodeId {
+        debug_assert!(matches!(
+            self.kind,
+            NodeKind::Neg | NodeKind::Not | NodeKind::StaticCast | NodeKind::DynamicCast
+        ));
+        self.get_input(1)
+    }
+
+    /// Condition operand (If).
+    #[inline]
+    pub fn predicate(&self) -> NodeId {
+        debug_assert_eq!(self.kind, NodeKind::If);
+        self.get_input(1)
+    }
+
+    /// Control region merge point (Phi).
+    #[inline]
+    pub fn region(&self) -> NodeId {
+        debug_assert_eq!(self.kind, NodeKind::Phi);
+        self.get_input(0)
     }
 
     #[inline]

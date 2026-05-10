@@ -162,8 +162,8 @@ impl IRBuilder {
             }
             self.node_outputs[new_id.as_usize()].push(user_id.0);
 
-            // Schedule re-idealization for pure users whose input changed
-            if kind.is_pure() {
+            // Schedule re-idealization for users whose input changed.
+            if kind.can_idealize() {
                 self.worklist.push(user_id);
             }
         }
@@ -285,10 +285,24 @@ impl IRBuilder {
 
     /// Braun Algorithm 3: detect and remove a trivial Phi.
     /// A Phi is trivial if it merges the same value (possibly with self-references).
-    /// TODO: The recursive cascade has no explicit depth bound — in pathological
-    /// cycles of Phis it terminates (each call eliminates one Phi) but very deep
-    /// graphs could cause stack overflow. Consider an iterative worklist approach.
+    /// Called eagerly during SSA construction (from add_phi_operands).
+    /// The cascading check of downstream Phis is deferred to the worklist.
     fn try_remove_trivial_phi(&mut self, phi_id: NodeId) -> NodeId {
+        let replacement = match self.is_trivial_phi(phi_id) {
+            Some(v) => v,
+            None => return phi_id,
+        };
+
+        // Reroute all uses of phi to replacement.
+        // replace_all_uses pushes affected Phi users to the worklist, so
+        // cascading trivial-Phi detection happens during worklist drain.
+        self.replace_all_uses(phi_id, replacement);
+        replacement
+    }
+
+    /// Check if a Phi is trivial — all value operands agree (ignoring self-refs).
+    /// Returns `Some(replacement)` if trivial, `None` otherwise.
+    fn is_trivial_phi(&self, phi_id: NodeId) -> Option<NodeId> {
         let mut same: Option<NodeId> = None;
         let phi = &self.nodes[phi_id.as_usize()];
 
@@ -299,34 +313,15 @@ impl IRBuilder {
                 continue;
             }
             if same.is_some() {
-                return phi_id; // At least two distinct values: not trivial
+                return None; // At least two distinct values: not trivial
             }
             same = Some(op);
         }
 
-        let replacement = match same {
+        Some(match same {
             Some(v) => v,
-            None => NodeId(0), // Phi references only itself (unreachable) → undef = node 0 (Unreachable)
-        };
-
-        // Snapshot phi's users before rerouting
-        let phi_users = self.node_outputs[phi_id.as_usize()].clone();
-
-        // Reroute all uses of phi to replacement
-        self.replace_all_uses(phi_id, replacement);
-
-        // Recursively check Phi users that might have become trivial
-        for idx in 0..phi_users.len() {
-            let user_id = NodeId(phi_users.get(idx));
-            if user_id != phi_id {
-                let kind = self.nodes[user_id.as_usize()].kind;
-                if kind == NodeKind::Phi {
-                    self.try_remove_trivial_phi(user_id);
-                }
-            }
-        }
-
-        replacement
+            None => NodeId(0), // Phi references only itself (unreachable) → undef
+        })
     }
 
     // ── Memory Convenience Methods ──
@@ -460,12 +455,12 @@ impl IRBuilder {
             self.create_add(rhs, lhs)?
         } else if r.kind == NodeKind::Neg {
             // x + (-y) => x - y
-            let y = self.lookup_node(r.get_input(1)).clone(); // Neg has input at index 1
+            let y = self.lookup_node(r.value()).clone();
             self.create_sub(lhs, &y)?
         } else if r.kind == NodeKind::Add {
             // x + (y + z) => (x + y) + z
-            let y = self.lookup_node(r.get_input(1)).clone(); // Left operand at index 1
-            let z = self.lookup_node(r.get_input(2)).clone(); // Right operand at index 2
+            let y = self.lookup_node(r.lhs()).clone();
+            let z = self.lookup_node(r.rhs()).clone();
             let xy = self.create_add(lhs, &y)?;
             self.create_add(&xy, &z)?
         } else {
@@ -492,12 +487,12 @@ impl IRBuilder {
             Node::num_of_type(0, &t)
         } else if r.kind == NodeKind::Neg {
             // x - (-y) => x + y
-            let y = self.lookup_node(r.get_input(1)).clone();
+            let y = self.lookup_node(r.value()).clone();
             self.create_add(lhs, &y)?
         } else if r.kind == NodeKind::Sub {
             // x - (y - z) => x - y + z => (x + z) - y
-            let y = self.lookup_node(r.get_input(1)).clone(); // Left operand at index 1
-            let z = self.lookup_node(r.get_input(2)).clone(); // Right operand at index 2
+            let y = self.lookup_node(r.lhs()).clone();
+            let z = self.lookup_node(r.rhs()).clone();
             let xz = self.create_add(lhs, &z)?;
             self.create_sub(&xz, &y)?
         } else {
@@ -695,11 +690,19 @@ impl IRBuilder {
     /// Returns `Some(new_id)` if the node was simplified to a different existing node,
     /// or `None` if it's already ideal.
     fn idealize(&mut self, slot: NodeId) -> Option<NodeId> {
-        let (kind, lhs, rhs): (NodeKind, NodeId, NodeId) = {
+        let kind = self.nodes[slot.as_usize()].kind;
+
+        // Phis are handled with a simple structural check (triviality)
+        // rather than re-running a creator function.
+        if kind == NodeKind::Phi {
+            return self.is_trivial_phi(slot).filter(|&id| id != slot);
+        }
+
+        let (lhs, rhs): (NodeId, NodeId) = {
             let node = &self.nodes[slot.as_usize()];
             let lhs = if node.inputs_len() > 1 { node.get_input(1) } else { NodeId(0) };
             let rhs = if node.inputs_len() > 2 { node.get_input(2) } else { NodeId(0) };
-            (node.kind, lhs, rhs)
+            (lhs, rhs)
         };
 
         let result = match kind {

@@ -101,7 +101,7 @@ fn test_arithmetic_algebraic_peepholes() {
     let result = builder.create_add(&x, &x).unwrap();
     assert_eq!(result.kind, NodeKind::Mul);
     // Should be x * 2
-    let mul_rhs = builder.lookup_node(result.get_input(2)); // Right operand is at index 2
+    let mul_rhs = builder.lookup_node(result.rhs());
     assert_eq!(mul_rhs.t.get_const_int(), Some(2));
 }
 
@@ -511,7 +511,7 @@ fn test_ssa_if_else_phi_insertion() {
     // The result should be a Phi node with inputs [region, five, ten]
     let phi_node = builder.lookup_node(result);
     assert_eq!(phi_node.kind, NodeKind::Phi);
-    assert_eq!(phi_node.get_input(0), region);
+    assert_eq!(phi_node.region(), region);
     // Inputs 1 and 2 are the values (order depends on predecessor ordering)
     let val1 = phi_node.get_input(1);
     let val2 = phi_node.get_input(2);
@@ -620,7 +620,7 @@ fn test_ssa_nested_if_else() {
 
     let phi_node = builder.lookup_node(result);
     assert_eq!(phi_node.kind, NodeKind::Phi);
-    assert_eq!(phi_node.get_input(0), outer_region);
+    assert_eq!(phi_node.region(), outer_region);
 
     // One operand should be the inner Phi, the other should be three_id
     let op1 = phi_node.get_input(1);
@@ -631,7 +631,7 @@ fn test_ssa_nested_if_else() {
     let inner_candidate = if op1 == three_id { op2 } else { op1 };
     let inner = builder.lookup_node(inner_candidate);
     assert_eq!(inner.kind, NodeKind::Phi);
-    assert_eq!(inner.get_input(0), inner_region);
+    assert_eq!(inner.region(), inner_region);
 }
 
 #[test]
@@ -989,8 +989,8 @@ fn test_memory_new_creates_node_and_updates_chain() {
     assert_eq!(builder.nodes()[new_id.as_usize()].t, foo_type);
 
     // New takes control and mem as inputs
-    assert_eq!(builder.nodes()[new_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
-    assert_eq!(builder.nodes()[new_id.as_usize()].get_input(1), NodeId(2)); // mem = Memory root
+    assert_eq!(builder.lookup_node(new_id).ctrl(), NodeId(1)); // control = Entry
+    assert_eq!(builder.lookup_node(new_id).memory(), NodeId(2)); // mem = Memory root
 
     // Current memory should now be the New node
     assert_eq!(builder.get_current_memory(), new_id);
@@ -1018,10 +1018,10 @@ fn test_memory_store_creates_node_and_updates_chain() {
     assert_eq!(builder.nodes()[store_id.as_usize()].t, Type::Memory);
 
     // Store inputs: [control, mem, ptr, value]
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(1), current_mem); // mem = New node
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(2), ptr);
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(3), val_id);
+    assert_eq!(builder.lookup_node(store_id).ctrl(), NodeId(1)); // control = Entry
+    assert_eq!(builder.lookup_node(store_id).memory(), current_mem); // mem = New node
+    assert_eq!(builder.lookup_node(store_id).ptr(), ptr);
+    assert_eq!(builder.lookup_node(store_id).store_value(), val_id);
 
     // Current memory should now be the Store node
     assert_eq!(builder.get_current_memory(), store_id);
@@ -1047,9 +1047,9 @@ fn test_memory_load_creates_node() {
     assert_eq!(builder.nodes()[load_id.as_usize()].t, loaded_type);
 
     // Load inputs: [control, mem, ptr]
-    assert_eq!(builder.nodes()[load_id.as_usize()].get_input(0), NodeId(1)); // control = Entry
-    assert_eq!(builder.nodes()[load_id.as_usize()].get_input(1), load_mem); // mem = New
-    assert_eq!(builder.nodes()[load_id.as_usize()].get_input(2), ptr);
+    assert_eq!(builder.lookup_node(load_id).ctrl(), NodeId(1)); // control = Entry
+    assert_eq!(builder.lookup_node(load_id).memory(), load_mem); // mem = New
+    assert_eq!(builder.lookup_node(load_id).ptr(), ptr);
 
     // Load does NOT update the memory chain — memory should still be the New node
     assert_eq!(builder.get_current_memory(), load_mem);
@@ -1075,9 +1075,9 @@ fn test_memory_chain_new_then_store_then_load() {
     assert_eq!(load_result, val_id, "Load should forward to stored value");
 
     // Verify the chain edges (Memory -> New -> Store)
-    assert_eq!(builder.nodes()[ptr.as_usize()].get_input(1), mem_root);
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(1), store_mem);
-    assert_eq!(builder.nodes()[store_id.as_usize()].get_input(3), val_id);
+    assert_eq!(builder.lookup_node(ptr).memory(), mem_root);
+    assert_eq!(builder.lookup_node(store_id).memory(), store_mem);
+    assert_eq!(builder.lookup_node(store_id).store_value(), val_id);
 
     // Memory chain: 2 (Memory) -> ptr (New) -> store_id (Store)
     assert_eq!(mem_root, NodeId(2));
@@ -1130,7 +1130,7 @@ fn test_memory_phi_at_merge() {
     let phi_node = builder.lookup_node(merged_mem);
     assert_eq!(phi_node.kind, NodeKind::Phi);
     assert_eq!(phi_node.t, Type::Memory);
-    assert_eq!(phi_node.get_input(0), region);
+    assert_eq!(phi_node.region(), region);
 
     // The Phi should merge the two final memory states
     let op1 = phi_node.get_input(1);
@@ -1559,7 +1559,7 @@ fn test_worklist_chain_reidealizes() {
     // mul was re-idealized: Mul(y, 10) — the interning lookup creates a new
     // Mul (since interned_nodes hash has the old inputs with add_id).
     // The old mul_id is dead; ten now has the new Mul as a user.
-    assert_ne!(builder.lookup_node(mul_id).get_input(1), add_id,
+    assert_ne!(builder.lookup_node(mul_id).lhs(), add_id,
         "mul's first input should no longer be add_id");
 
     // ten has at least one user (the new Mul replacing the old one)
