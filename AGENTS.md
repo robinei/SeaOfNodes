@@ -42,9 +42,14 @@ See [`PLAN.md`](./PLAN.md) for the prioritized roadmap.
 ├── PLAN.md            # Prioritized goals
 ├── Cargo.toml
 └── src/
-    ├── main.rs        # Node, IRBuilder, SSA construction, all tests
+    ├── main.rs        # Module declarations, main entry point
+    ├── node.rs        # Node, NodeId, NodeKind, node operations
+    ├── builder.rs     # IRBuilder, SSA construction (Braun-style lazy Phis)
     ├── types.rs       # Type algebra (union, intersect, subtract, cast analysis)
     ├── constraints.rs # Generic RangeConstraint<T>, Bool/Float/Int/UInt constraints
     ├── compact_vec.rs # Multi-tier compact vector for node input storage
-    └── symbols.rs     # Thread-safe symbol interning with NonZeroU32
+    ├── symbols.rs     # Thread-safe symbol interning with NonZeroU32
+    └── tests/
+        ├── mod.rs     # Test module declarations
+        └── builder.rs # IRBuilder tests (constant folding, peepholes, value numbering)
 ```
