@@ -149,6 +149,8 @@ impl IRBuilder {
         self.node_outputs[old_id.as_usize()].set_all(&[]);
 
         // Rewire each old user to point to new_id instead of old_id
+        // Replace ALL occurrences of old_id in each user's inputs (not just the first one).
+        // A node can reference the same value multiple times, e.g., Add(x, x).
         for idx in 0..old_outputs.len() {
             let user_id = NodeId(old_outputs.get(idx));
             let kind = self.nodes[user_id.as_usize()].kind;
@@ -156,7 +158,6 @@ impl IRBuilder {
             for j in 0..user.inputs_len() {
                 if user.get_input(j) == old_id {
                     user.set_input(j, new_id);
-                    break;
                 }
             }
             self.node_outputs[new_id.as_usize()].push(user_id.0);
@@ -215,6 +216,9 @@ impl IRBuilder {
     }
 
     /// Braun-style backward search for a variable's reaching definition.
+    /// TODO: Consider adding a recursion depth limit as a safety net — the
+    /// Braun backward search can recurse arbitrarily deep through predecessor
+    /// chains (terminates in practice but no explicit safeguard).
     fn read_variable_recursive(&mut self, var: VarId, ctrl: NodeId) -> NodeId {
         if !self.sealed.contains(&ctrl) {
             // Incomplete CFG: place an operandless Phi and record it as incomplete
@@ -249,6 +253,8 @@ impl IRBuilder {
 
     /// Fill operands of a newly-created Phi by recursively reading from each predecessor.
     /// Then attempt trivial Phi elimination.
+    /// TODO: Consider deduplicating identical operands from different predecessors
+    /// to avoid bloated Phis that immediately collapse via try_remove_trivial_phi.
     fn add_phi_operands(&mut self, var: VarId, phi_id: NodeId, ctrl: NodeId) -> NodeId {
         let preds = self.get_control_predecessors(ctrl);
         let mut operand_types: Vec<Type> = Vec::new();
@@ -279,6 +285,9 @@ impl IRBuilder {
 
     /// Braun Algorithm 3: detect and remove a trivial Phi.
     /// A Phi is trivial if it merges the same value (possibly with self-references).
+    /// TODO: The recursive cascade has no explicit depth bound — in pathological
+    /// cycles of Phis it terminates (each call eliminates one Phi) but very deep
+    /// graphs could cause stack overflow. Consider an iterative worklist approach.
     fn try_remove_trivial_phi(&mut self, phi_id: NodeId) -> NodeId {
         let mut same: Option<NodeId> = None;
         let phi = &self.nodes[phi_id.as_usize()];
@@ -359,6 +368,9 @@ impl IRBuilder {
 
     /// Add a new predecessor to a Loop node (for back-edges).
     /// The loop is not sealed yet, so no Phi filling is triggered.
+    /// TODO: Add guard against adding back-edges after sealing — the protocol
+    /// requires all back-edges be added before seal() is called. If a back-edge
+    /// is added after sealing, Phis placed earlier would miss that predecessor.
     pub fn push_loop_back_edge(&mut self, loop_ctrl: NodeId, back_edge: NodeId) {
         self.nodes[loop_ctrl.as_usize()].push_input(back_edge);
         // Register the back-edge as a user of loop_ctrl's outputs...
@@ -370,6 +382,8 @@ impl IRBuilder {
     /// Seal a control node — no more predecessors will be added.
     /// Fills in any incomplete Phis (including memory Phis, since memory is VarId 0)
     /// that were placed before sealing.
+    /// TODO: Consider verifying that all back-edges have been added before sealing
+    /// a Loop node. Currently the protocol is caller-enforced (add back-edges, then seal).
     pub fn seal(&mut self, ctrl: NodeId) {
         self.sealed.insert(ctrl);
 
@@ -390,6 +404,9 @@ impl IRBuilder {
     }
 
     /// Create a Phi node with the given control and value inputs.
+    /// The type starts as Never and is refined in add_phi_operands.
+    /// TODO: The intermediate Never type between creation and operand filling
+    /// could confuse debugging/inspection. Consider using a dedicated placeholder.
     fn create_phi_node(&self, ctrl: NodeId, values: &[NodeId]) -> Node {
         let mut node = Node::new(NodeKind::Phi, Type::Never);
         let mut inputs = vec![ctrl];
@@ -627,6 +644,10 @@ impl IRBuilder {
     }
 
     /// Create a Load (memory read) node with on-the-fly Load-Store forwarding.
+    /// TODO: Load-Store forwarding only checks the immediate memory predecessor.
+    /// Consider walking back through intermediate Stores to different ptrs:
+    ///   Store(ptr, 10) -> Store(ptr1, 7) -> Load(ptr, mem=Store(ptr1,7))
+    /// currently misses forwarding the value 10 from the earlier Store.
     pub fn create_load(&mut self, mem: NodeId, ptr: NodeId, loaded_type: Type) -> NodeId {
         // Peephole: Load-Store forwarding
         let mem_node = &self.nodes[mem.as_usize()];
