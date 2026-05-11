@@ -410,7 +410,7 @@ fn test_ssa_create_variable_and_set_control() {
 
     // Create a variable
     let v = builder.create_variable("x");
-    assert_eq!(v, VarId(1)); // VarId(0) is reserved for memory
+    assert_eq!(v, VarId(0)); // first user variable
 
     // Set control to something else
     builder.set_control(NodeId(1)); // Entry
@@ -931,6 +931,11 @@ fn test_ssa_replace_all_uses_cleans_up_inputs() {
 
 // ── Memory Tests ──
 
+/// Helper to create a simple record type for memory tests.
+fn point_type() -> Type {
+    Type::make_record(vec![("x", Type::I32)])
+}
+
 #[test]
 fn test_memory_node_created() {
     let builder = IRBuilder::new();
@@ -941,26 +946,22 @@ fn test_memory_node_created() {
 }
 
 #[test]
-fn test_memory_current_memory_at_entry() {
+fn test_memory_current_memory_for_type_at_entry() {
     let mut builder = IRBuilder::new();
-    // At Entry, the current memory should be the Memory node (node 2)
-    assert_eq!(builder.get_current_memory(), NodeId(2));
-}
-
-#[test]
-fn test_memory_set_current_memory() {
-    let mut builder = IRBuilder::new();
-    let mem_id = NodeId(2); // initial Memory node
-    assert_eq!(builder.get_current_memory(), mem_id);
-
-    // Set a different memory (e.g., a Store or New node id)
-    builder.set_current_memory(NodeId(42));
-    assert_eq!(builder.get_current_memory(), NodeId(42));
+    let obj_type = point_type();
+    // get_memory_for_type creates the chain and initializes it with Memory root
+    let mem = builder.get_memory_for_type(&obj_type);
+    assert_eq!(mem, NodeId(2));
 }
 
 #[test]
 fn test_memory_single_predecessor_chain() {
     let mut builder = IRBuilder::new();
+    let obj_type = point_type();
+
+    // Initialize the type's chain at Entry
+    let initial_mem = builder.get_memory_for_type(&obj_type);
+    assert_eq!(initial_mem, NodeId(2));
 
     // Entry -> If -> Then (single predecessor chain)
     let cond_true = Node::const_bool(true);
@@ -969,7 +970,7 @@ fn test_memory_single_predecessor_chain() {
 
     // Memory at Then should propagate through chain: Entry -> If -> Then
     builder.set_control(then_ctrl);
-    let mem = builder.get_current_memory();
+    let mem = builder.get_memory_for_type(&obj_type);
     assert_eq!(mem, NodeId(2)); // Should find the initial Memory node
 }
 
@@ -977,12 +978,8 @@ fn test_memory_single_predecessor_chain() {
 fn test_memory_new_creates_node_and_updates_chain() {
     let mut builder = IRBuilder::new();
 
-    let mem_id = builder.get_current_memory();
-    assert_eq!(mem_id, NodeId(2)); // initial Memory
-
-    // Allocate: create a new Foo object
     let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
-    let new_id = builder.create_new(mem_id, foo_type.clone());
+    let new_id = builder.create_new(foo_type.clone());
 
     // The New node should be a node with kind New and type foo_type
     assert_eq!(builder.nodes()[new_id.as_usize()].kind, NodeKind::New);
@@ -992,26 +989,23 @@ fn test_memory_new_creates_node_and_updates_chain() {
     assert_eq!(builder.lookup_node(new_id).ctrl(), NodeId(1)); // control = Entry
     assert_eq!(builder.lookup_node(new_id).memory(), NodeId(2)); // mem = Memory root
 
-    // Current memory should now be the New node
-    assert_eq!(builder.get_current_memory(), new_id);
+    // Current memory for this type should now be the New node
+    assert_eq!(builder.get_memory_for_type(&foo_type), new_id);
 }
 
 #[test]
 fn test_memory_store_creates_node_and_updates_chain() {
     let mut builder = IRBuilder::new();
 
-    let mem_id = builder.get_current_memory(); // Memory root (node 2)
     let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
 
     // Allocate first
-    let ptr = builder.create_new(mem_id, foo_type);
-    // Current memory is now the New node
+    let ptr = builder.create_new(foo_type.clone());
 
     // Store: write a value into the allocated object
     let val = Node::const_int(42);
     let val_id = builder.intern_node(&val);
-    let current_mem = builder.get_current_memory(); // Should be New
-    let store_id = builder.create_store(current_mem, ptr, val_id);
+    let store_id = builder.create_store(ptr, val_id);
 
     // The Store node should have kind Store and type Memory
     assert_eq!(builder.nodes()[store_id.as_usize()].kind, NodeKind::Store);
@@ -1019,28 +1013,26 @@ fn test_memory_store_creates_node_and_updates_chain() {
 
     // Store inputs: [control, mem, ptr, value]
     assert_eq!(builder.lookup_node(store_id).ctrl(), NodeId(1)); // control = Entry
-    assert_eq!(builder.lookup_node(store_id).memory(), current_mem); // mem = New node
+    assert_eq!(builder.lookup_node(store_id).memory(), ptr); // mem = New node
     assert_eq!(builder.lookup_node(store_id).ptr(), ptr);
     assert_eq!(builder.lookup_node(store_id).store_value(), val_id);
 
-    // Current memory should now be the Store node
-    assert_eq!(builder.get_current_memory(), store_id);
+    // Current memory for this type should now be the Store node
+    assert_eq!(builder.get_memory_for_type(&foo_type), store_id);
 }
 
 #[test]
 fn test_memory_load_creates_node() {
     let mut builder = IRBuilder::new();
 
-    let mem_id = builder.get_current_memory(); // Memory root (node 2)
     let foo_type = Type::make_tuple(vec![Type::I32, Type::I32]);
 
     // Allocate
-    let ptr = builder.create_new(mem_id, foo_type);
+    let ptr = builder.create_new(foo_type.clone());
 
     // Load from the allocation
     let loaded_type = Type::I32;
-    let load_mem = builder.get_current_memory(); // New node
-    let load_id = builder.create_load(load_mem, ptr, loaded_type.clone());
+    let load_id = builder.create_load(ptr, loaded_type.clone());
 
     // The Load node should have kind Load and type I32
     assert_eq!(builder.nodes()[load_id.as_usize()].kind, NodeKind::Load);
@@ -1048,49 +1040,43 @@ fn test_memory_load_creates_node() {
 
     // Load inputs: [control, mem, ptr]
     assert_eq!(builder.lookup_node(load_id).ctrl(), NodeId(1)); // control = Entry
-    assert_eq!(builder.lookup_node(load_id).memory(), load_mem); // mem = New
+    assert_eq!(builder.lookup_node(load_id).memory(), ptr); // mem = New
     assert_eq!(builder.lookup_node(load_id).ptr(), ptr);
 
-    // Load does NOT update the memory chain — memory should still be the New node
-    assert_eq!(builder.get_current_memory(), load_mem);
+    // Load does NOT update the memory chain
+    assert_eq!(builder.get_memory_for_type(&foo_type), ptr);
 }
 
 #[test]
 fn test_memory_chain_new_then_store_then_load() {
     let mut builder = IRBuilder::new();
 
-    let mem_root = builder.get_current_memory(); // Memory root (node 2)
     let obj_type = Type::make_tuple(vec![Type::I32]);
 
     // Chain: Memory -> New -> Store
-    let ptr = builder.create_new(mem_root, obj_type);
-    let store_mem = builder.get_current_memory(); // should be New
+    let ptr = builder.create_new(obj_type.clone());
     let val = Node::const_int(99);
     let val_id = builder.intern_node(&val);
-    let store_id = builder.create_store(store_mem, ptr, val_id);
+    let store_id = builder.create_store(ptr, val_id);
 
     // Now load: uses Store's memory state — Load-Store forwarding returns val_id directly
-    let load_mem = builder.get_current_memory(); // should be Store
-    let load_result = builder.create_load(load_mem, ptr, Type::I32);
+    let load_result = builder.create_load(ptr, Type::I32);
     assert_eq!(load_result, val_id, "Load should forward to stored value");
 
     // Verify the chain edges (Memory -> New -> Store)
-    assert_eq!(builder.lookup_node(ptr).memory(), mem_root);
-    assert_eq!(builder.lookup_node(store_id).memory(), store_mem);
+    assert_eq!(builder.lookup_node(ptr).memory(), NodeId(2));
+    assert_eq!(builder.lookup_node(store_id).memory(), ptr);
     assert_eq!(builder.lookup_node(store_id).store_value(), val_id);
 
     // Memory chain: 2 (Memory) -> ptr (New) -> store_id (Store)
-    assert_eq!(mem_root, NodeId(2));
-    assert_eq!(store_mem, ptr);
-    assert_eq!(load_mem, store_id);
+    assert_eq!(builder.get_memory_for_type(&obj_type), store_id);
 }
 
 #[test]
 fn test_memory_phi_at_merge() {
     let mut builder = IRBuilder::new();
 
-    let mem_root = builder.get_current_memory(); // Memory root (node 2)
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
     // Entry -> If -> Then/Else -> Region
     let cond = Node::const_bool(true);
@@ -1100,31 +1086,29 @@ fn test_memory_phi_at_merge() {
 
     // Then branch: allocate and store
     builder.set_control(then_ctrl);
-    let then_mem = builder.get_current_memory(); // should propagate from Entry
-    assert_eq!(then_mem, mem_root);
-    let ptr_then = builder.create_new(then_mem, obj_type.clone());
+    let then_mem = builder.get_memory_for_type(&obj_type); // should propagate from Entry
+    assert_eq!(then_mem, NodeId(2));
+    let ptr_then = builder.create_new(obj_type.clone());
     let val1 = Node::const_int(1);
     let val1_id = builder.intern_node(&val1);
-    let then_before_store = builder.get_current_memory();
-    builder.create_store(then_before_store, ptr_then, val1_id);
-    let then_final_mem = builder.get_current_memory(); // the Store
+    builder.create_store(ptr_then, val1_id);
+    let then_final_mem = builder.get_memory_for_type(&obj_type); // the Store
 
     // Else branch: just allocate (different ptr name but same type)
     builder.set_control(else_ctrl);
-    let else_mem = builder.get_current_memory(); // should propagate from Entry
-    assert_eq!(else_mem, mem_root);
-    let ptr_else = builder.create_new(else_mem, obj_type);
+    let else_mem = builder.get_memory_for_type(&obj_type); // should propagate from Entry
+    assert_eq!(else_mem, NodeId(2));
+    let ptr_else = builder.create_new(obj_type.clone());
     let val2 = Node::const_int(2);
     let val2_id = builder.intern_node(&val2);
-    let else_before_store = builder.get_current_memory();
-    builder.create_store(else_before_store, ptr_else, val2_id);
-    let else_final_mem = builder.get_current_memory(); // the Store
+    builder.create_store(ptr_else, val2_id);
+    let else_final_mem = builder.get_memory_for_type(&obj_type); // the Store
 
     // Merge at Region — memory should be different on both paths, so a memory Phi is needed
     let region = builder.create_region(&[then_ctrl, else_ctrl]);
     builder.set_control(region);
 
-    let merged_mem = builder.get_current_memory();
+    let merged_mem = builder.get_memory_for_type(&obj_type);
 
     // Should be a memory Phi (since Then and Else have different memory states)
     let phi_node = builder.lookup_node(merged_mem);
@@ -1146,6 +1130,7 @@ fn test_memory_phi_at_merge() {
 #[test]
 fn test_memory_trivial_phi_elimination() {
     let mut builder = IRBuilder::new();
+    let obj_type = point_type();
 
     // Entry -> If -> Then/Else -> Region
     // Both branches have the SAME memory (no stores/allocations), so memory Phi should be trivial
@@ -1159,7 +1144,7 @@ fn test_memory_trivial_phi_elimination() {
     builder.set_control(region);
 
     // No memory Phi needed — both paths reach the same memory (Memory root = node 2)
-    let mem = builder.get_current_memory();
+    let mem = builder.get_memory_for_type(&obj_type);
     assert_eq!(mem, NodeId(2)); // Directly the Memory root, no Phi
 }
 
@@ -1167,8 +1152,9 @@ fn test_memory_trivial_phi_elimination() {
 fn test_memory_partial_definition_at_merge() {
     // Memory modified on one branch only, passes through on the other
     let mut builder = IRBuilder::new();
+    let obj_type = point_type();
 
-    let mem_root = builder.get_current_memory();
+    let mem_root = builder.get_memory_for_type(&obj_type);
 
     // Entry -> If -> Then/Else -> Region
     let cond = Node::const_bool(true);
@@ -1178,21 +1164,19 @@ fn test_memory_partial_definition_at_merge() {
 
     // Then branch: allocate (changes memory)
     builder.set_control(then_ctrl);
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
-    let then_ctrl_mem = builder.get_current_memory();
-    let _ptr_then = builder.create_new(then_ctrl_mem, obj_type);
-    let then_mem = builder.get_current_memory(); // the New node
+    let _then_ctrl_mem = builder.get_memory_for_type(&obj_type);
+    let _ptr_then = builder.create_new(obj_type.clone());
+    let then_mem = builder.get_memory_for_type(&obj_type); // the New node
 
     // Else branch: NO memory modification — still has the Memory root
     builder.set_control(else_ctrl);
-    // Current memory here should propagate through Entry -> If -> Else, landing on Memory root
-    assert_eq!(builder.get_current_memory(), mem_root);
+    assert_eq!(builder.get_memory_for_type(&obj_type), mem_root);
 
     // Merge at Region
     let region = builder.create_region(&[then_ctrl, else_ctrl]);
     builder.set_control(region);
 
-    let merged_mem = builder.get_current_memory();
+    let merged_mem = builder.get_memory_for_type(&obj_type);
 
     // Should be a Phi: merges 'then_mem' (New) and mem_root (Memory) since one path changed it
     let phi_node = builder.lookup_node(merged_mem);
@@ -1214,18 +1198,16 @@ fn test_memory_load_after_store_reads_same() {
     // a Store to the same ptr returns the stored value directly (no Load node).
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let point_type = Type::make_record(vec![("x", Type::I32)]);
+    let point_type = point_type();
 
     // Allocate, store x=42, then load x
-    let ptr = builder.create_new(mem, point_type);
+    let ptr = builder.create_new(point_type);
     let val = Node::const_int(42);
     let val_id = builder.intern_node(&val);
-    let store_before = builder.get_current_memory();
-    let store_mem = builder.create_store(store_before, ptr, val_id);
+    let _store_mem = builder.create_store(ptr, val_id);
 
     // Load from same ptr, using Store as memory — forwarded to stored value
-    let load_result = builder.create_load(store_mem, ptr, Type::I32);
+    let load_result = builder.create_load(ptr, Type::I32);
     assert_eq!(load_result, val_id, "Load should be forwarded to the stored value");
 }
 
@@ -1233,27 +1215,26 @@ fn test_memory_load_after_store_reads_same() {
 fn test_memory_incomplete_phi_on_seal() {
     // Test that memory Phis placed before a block is sealed get filled on seal()
     let mut builder = IRBuilder::new();
+    let obj_type = point_type();
+
+    // Initialize the type's chain at Entry
+    let _initial = builder.get_memory_for_type(&obj_type);
 
     // Create a Loop (not auto-sealed) to simulate incomplete CFG
     let loop_ctrl = builder.create_loop(NodeId(1)); // Entry -> Loop, NOT sealed
     builder.set_control(loop_ctrl);
 
     // Read memory at unsealed loop — creates an incomplete memory Phi
-    let _mem_at_loop = builder.get_current_memory();
-
-    // The incomplete_phis should have an entry for MEMORY_VAR at this control
-    assert!(builder.incomplete_phis().contains_key(&(MEMORY_VAR, loop_ctrl)));
+    let _mem_at_loop = builder.get_memory_for_type(&obj_type);
 
     // Create back-edge and seal
     let back_edge = builder.create_region(&[loop_ctrl]);
     builder.push_loop_back_edge(loop_ctrl, back_edge);
     builder.seal(loop_ctrl);
 
-    // After sealing, the incomplete Phi should have been filled
-    assert!(!builder.incomplete_phis().contains_key(&(MEMORY_VAR, loop_ctrl)));
-
-    // Memory at loop should be resolved (either Memory root, or a trivial Phi collapsed)
-    let mem = builder.get_current_memory();
+    // After sealing, memory should be resolved (both paths reach Memory root)
+    builder.set_control(loop_ctrl);
+    let mem = builder.get_memory_for_type(&obj_type);
     assert_eq!(mem, NodeId(2)); // Both predecessors reach Memory root — Phi collapsed
 }
 
@@ -1262,17 +1243,15 @@ fn test_memory_load_store_forwarding() {
     // Load immediately after Store to same ptr → return stored value directly
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
-    let ptr = builder.create_new(mem, obj_type);
-    let store_before = builder.get_current_memory();
+    let ptr = builder.create_new(obj_type);
     let val = Node::const_int(42);
     let val_id = builder.intern_node(&val);
-    let store = builder.create_store(store_before, ptr, val_id);
+    let _store = builder.create_store(ptr, val_id);
 
     // Load from same ptr using Store as memory → should forward to val_id
-    let load_result = builder.create_load(store, ptr, Type::I32);
+    let load_result = builder.create_load(ptr, Type::I32);
     assert_eq!(load_result, val_id, "Load should forward to Store's value");
 }
 
@@ -1281,13 +1260,10 @@ fn test_memory_load_without_store_creates_node() {
     // Load from New without any prior Store → should create a Load node
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
-    let ptr = builder.create_new(mem, obj_type);
-    let new_mem = builder.get_current_memory(); // the New node
-
-    let load_id = builder.create_load(new_mem, ptr, Type::I32);
+    let ptr = builder.create_new(obj_type);
+    let load_id = builder.create_load(ptr, Type::I32);
     assert_ne!(load_id, NodeId(0));
     let load_node = builder.lookup_node(load_id);
     assert_eq!(load_node.kind, NodeKind::Load);
@@ -1298,23 +1274,19 @@ fn test_memory_load_store_diff_ptr_no_forward() {
     // Store to ptr1, Load from ptr2 → should NOT forward
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj1_type = Type::make_record(vec![("x", Type::I32)]);
-    let obj2_type = Type::make_record(vec![("x", Type::I32)]);
+    // Same type so both ptrs share the chain (type-based serialization)
+    let obj_type = point_type();
 
-    let ptr1 = builder.create_new(mem, obj1_type);
-    let mem_after_new1 = builder.get_current_memory();
-    let ptr2 = builder.create_new(mem_after_new1, obj2_type);
+    let ptr1 = builder.create_new(obj_type.clone());
+    let ptr2 = builder.create_new(obj_type);
 
     // Store to ptr1
     let val = Node::const_int(7);
     let val_id = builder.intern_node(&val);
-    let store_before = builder.get_current_memory();
-    let _store = builder.create_store(store_before, ptr1, val_id);
+    let _store = builder.create_store(ptr1, val_id);
 
-    // Load from ptr2 (different ptr) — should NOT forward
-    let mem_after_store = builder.get_current_memory();
-    let load_id = builder.create_load(mem_after_store, ptr2, Type::I32);
+    // Load from ptr2 (different ptr, same type chain) — should NOT forward
+    let load_id = builder.create_load(ptr2, Type::I32);
     let load_node = builder.lookup_node(load_id);
     assert_eq!(
         load_node.kind,
@@ -1328,24 +1300,22 @@ fn test_memory_load_forward_from_last_store() {
     // Two Stores to the same ptr, then Load → should forward from last Store
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
-    let ptr = builder.create_new(mem, obj_type);
-    let mem_after_new = builder.get_current_memory();
+    let ptr = builder.create_new(obj_type);
 
     // First store: x = 7
     let val1 = Node::const_int(7);
     let val1_id = builder.intern_node(&val1);
-    let store1 = builder.create_store(mem_after_new, ptr, val1_id);
+    let _store1 = builder.create_store(ptr, val1_id);
 
     // Second store: x = 99 (overwrites)
     let val2 = Node::const_int(99);
     let val2_id = builder.intern_node(&val2);
-    let store2 = builder.create_store(store1, ptr, val2_id);
+    let _store2 = builder.create_store(ptr, val2_id);
 
     // Load — should forward to 99 (the last store's value)
-    let load_result = builder.create_load(store2, ptr, Type::I32);
+    let load_result = builder.create_load(ptr, Type::I32);
     assert_eq!(
         load_result, val2_id,
         "Load should forward to the most recent Store's value"
@@ -1357,8 +1327,7 @@ fn test_memory_load_store_via_phi_no_forward() {
     // When memory reaches Load through a Phi, we can't forward
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
     // Entry -> If -> Then/Else -> Region
     let cond = Node::const_bool(true);
@@ -1368,24 +1337,22 @@ fn test_memory_load_store_via_phi_no_forward() {
 
     // Then: allocate and store 10
     builder.set_control(then_ctrl);
-    let ptr = builder.create_new(mem, obj_type.clone());
-    let then_mem_after_new = builder.get_current_memory();
+    let ptr = builder.create_new(obj_type.clone());
     let val = Node::const_int(10);
     let val_id = builder.intern_node(&val);
-    let _then_store = builder.create_store(then_mem_after_new, ptr, val_id);
+    let _then_store = builder.create_store(ptr, val_id);
 
-    // Else: just allocate (no store), different ptr
+    // Else: just allocate (no store), same type
     builder.set_control(else_ctrl);
-    let _ptr_else = builder.create_new(mem, obj_type);
-    let _else_mem = builder.get_current_memory();
+    let _ptr_else = builder.create_new(obj_type.clone());
 
     // Merge at Region — memory Phi merges Store and New
     let region = builder.create_region(&[then_ctrl, else_ctrl]);
     builder.set_control(region);
-    let merged_mem = builder.get_current_memory();
+    let _merged_mem = builder.get_memory_for_type(&obj_type);
 
     // Load from ptr using merged memory (a Phi) — should NOT forward
-    let load_id = builder.create_load(merged_mem, ptr, Type::I32);
+    let load_id = builder.create_load(ptr, Type::I32);
     let load_node = builder.lookup_node(load_id);
     assert_eq!(
         load_node.kind,
@@ -1399,21 +1366,19 @@ fn test_memory_load_store_skips_output_edges() {
     // When Load-Store forwarding fires, no extra output edges should appear
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
-    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+    let obj_type = point_type();
 
-    let ptr = builder.create_new(mem, obj_type);
-    let store_before = builder.get_current_memory();
+    let ptr = builder.create_new(obj_type);
     let val = Node::const_int(42);
     let val_id = builder.intern_node(&val);
-    let store = builder.create_store(store_before, ptr, val_id);
+    let store = builder.create_store(ptr, val_id);
 
     // Track outputs of Store and value before Load
     let store_outputs_before = builder.node_outputs()[store.as_usize()].len();
     let val_outputs_before = builder.node_outputs()[val_id.as_usize()].len();
 
     // Load that gets forwarded — should not add output edges
-    let _load_result = builder.create_load(store, ptr, Type::I32);
+    let _load_result = builder.create_load(ptr, Type::I32);
 
     // Store's outputs should not have changed (no Load node created)
     assert_eq!(
@@ -1435,38 +1400,102 @@ fn test_memory_output_tracking() {
     // Verify that memory operations properly track output edges
     let mut builder = IRBuilder::new();
 
-    let mem = builder.get_current_memory();
     let obj_type = Type::make_tuple(vec![Type::I32]);
 
-    // Allocate: New consumes Memory, produces ptr/NewMem
-    let ptr = builder.create_new(mem, obj_type);
+    let mem_root = NodeId(2);
 
-    // Memory root should have New as a user
-    assert!(builder.node_outputs()[mem.as_usize()]
+    // Allocate: New consumes Memory, produces ptr/NewMem
+    let ptr = builder.create_new(obj_type.clone());
+
+    // Memory root should have New as a user (through New's memory input)
+    assert!(builder.node_outputs()[mem_root.as_usize()]
         .iter()
         .any(|id| id == ptr.0));
 
-    // Allocate a second object BEFORE the store so we can use the store's
-    // memory with a different pointer (no forwarding).
-    let obj2_type = Type::make_tuple(vec![Type::I32]);
-    let current_mem = builder.get_current_memory();
-    let ptr2 = builder.create_new(current_mem, obj2_type);
-    // Now current memory is the 2nd New (ptr2). The store will write to ptr.
-    let store_mem = builder.get_current_memory(); // 2nd New
+    // Allocate a second object of the same type
+    let ptr2 = builder.create_new(obj_type);
+
+    // ptr (first New) should have ptr2 (second New) as a user (through ptr2's memory input)
+    assert!(builder.node_outputs()[ptr.as_usize()]
+        .iter()
+        .any(|id| id == ptr2.0));
+
+    // Store to ptr using the chain (now at ptr2)
     let val = Node::const_int(7);
     let val_id = builder.intern_node(&val);
-    let store = builder.create_store(store_mem, ptr, val_id);
+    let store = builder.create_store(ptr, val_id);
 
-    // New (ptr) should have Store as a user (ptr is the first New)
+    // ptr should have Store as a user (through Store's ptr input)
     assert!(builder.node_outputs()[ptr.as_usize()]
         .iter()
         .any(|id| id == store.0));
 
-    // Load from ptr2 (not ptr) using Store's memory — different ptrs, no forwarding.
-    let load = builder.create_load(store, ptr2, Type::I32);
+    // ptr2 should have Store as a user (through Store's mem input)
+    assert!(builder.node_outputs()[ptr2.as_usize()]
+        .iter()
+        .any(|id| id == store.0));
+
+    // Load from ptr2 using Store's memory — different ptrs, no forwarding, creates Load node
+    let load = builder.create_load(ptr2, Type::I32);
     assert!(builder.node_outputs()[store.as_usize()]
         .iter()
         .any(|id| id == load.0));
+}
+
+#[test]
+fn test_memory_per_type_independence() {
+    // Two different types should have independent memory chains
+    let mut builder = IRBuilder::new();
+
+    let point_type = Type::make_record(vec![("x", Type::I32), ("y", Type::I32)]);
+    let color_type = Type::make_record(vec![("r", Type::I32), ("g", Type::I32), ("b", Type::I32)]);
+
+    let p = builder.create_new(point_type.clone());  // chains onto VarId(point_type)
+    let c = builder.create_new(color_type.clone());  // chains onto VarId(color_type)
+
+    let v5 = Node::const_int(5);
+    let v5_id = builder.intern_node(&v5);
+    let v10 = Node::const_int(10);
+    let v10_id = builder.intern_node(&v10);
+
+    // These are on different chains — no ordering constraint
+    builder.create_store(p, v5_id);   // writes VarId(point_type)
+    builder.create_store(c, v10_id);  // writes VarId(color_type)
+
+    // Each type's chain should have the respective last operation
+    let point_mem = builder.get_memory_for_type(&point_type);
+    let color_mem = builder.get_memory_for_type(&color_type);
+    assert_ne!(point_mem, color_mem, "Different types should have different memory chains");
+}
+
+#[test]
+fn test_memory_same_type_serialization() {
+    // Two allocations of the same type share one chain and are serialized
+    let mut builder = IRBuilder::new();
+
+    let obj_type = Type::make_record(vec![("x", Type::I32)]);
+
+    let p1 = builder.create_new(obj_type.clone());   // type [("x", I32)]
+    let p2 = builder.create_new(obj_type.clone());   // same type — same chain
+
+    // p2's memory input should be p1 (they chain through the same variable)
+    assert_eq!(builder.lookup_node(p2).memory(), p1);
+
+    let v5 = Node::const_int(5);
+    let v5_id = builder.intern_node(&v5);
+    let v10 = Node::const_int(10);
+    let v10_id = builder.intern_node(&v10);
+
+    // A store to p1 overwrites the chain
+    builder.create_store(p1, v5_id);
+    let p1_store_mem = builder.get_memory_for_type(&obj_type);
+
+    // A store to p2 goes through the same chain
+    builder.create_store(p2, v10_id);
+    let p2_store_mem = builder.get_memory_for_type(&obj_type);
+
+    // The stores are serialized
+    assert_ne!(p1_store_mem, p2_store_mem);
 }
 
 // ── Worklist / Idealization Tests ──

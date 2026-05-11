@@ -51,9 +51,8 @@ tangible and catch integration bugs.
   coarse — could be narrowed with lattice meet
 - **Freelist / `kill_node`**: deferred — NodeId stability is more important
   than memory reuse at this stage
-- **Alias-class memory chains**: Replace the single `MEMORY_VAR` with
-  per-class memory SSA variables. Each `New` gets tagged with an alias class;
-  `Load`/`Store` only serialize within the same class. Independent operations
-  on different objects become fully parallel. Same approach as JVM's C2 compiler.
-  Requires: dynamic alias class allocation, per-class SSA chain, mapping from
-  `New` → alias class, per-class memory Phis at control merges.
+- **Alias-class memory chains** ✅ Done
+  Replaced the single `MEMORY_VAR` with per-type memory SSA variables. Each
+  concrete heap type (`Data` or `Union`) gets its own memory chain. Independent
+  operations on different types become fully parallel. Per-class memory Phis
+  at control merges are handled automatically by Braun-style SSA.

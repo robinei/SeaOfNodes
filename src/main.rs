@@ -71,11 +71,9 @@ fn build_example_graph() -> String {
 
     // ── Memory chain: allocate a record and store x into it ──
     builder.set_control(then_ctrl);
-    let mem = builder.get_current_memory();
     let obj_type = Type::make_record(vec![("x", Type::I32)]);
-    let ptr = builder.create_new(mem, obj_type);
-    let store_mem = builder.get_current_memory();
-    let _store = builder.create_store(store_mem, ptr, add_id);
+    let ptr = builder.create_new(obj_type);
+    let _store = builder.create_store(ptr, add_id);
 
     builder.to_dot()
 }

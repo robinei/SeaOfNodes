@@ -334,13 +334,11 @@ mod tests {
     #[test]
     fn test_dot_memory_chain() {
         let mut builder = IRBuilder::new();
-        let mem = builder.get_current_memory();
         let obj_type = Type::make_record(vec![("x", Type::I32)]);
-        let ptr = builder.create_new(mem, obj_type);
+        let ptr = builder.create_new(obj_type);
         let val = Node::const_int(42);
         let val_id = builder.intern_node(&val);
-        let store_before = builder.get_current_memory();
-        let _store = builder.create_store(store_before, ptr, val_id);
+        let _store = builder.create_store(ptr, val_id);
 
         let dot = builder.to_dot();
         assert!(dot.contains("Memory"));
@@ -399,11 +397,9 @@ mod tests {
         let _y_phi = builder.read_variable(y_var);
 
         builder.set_control(then_ctrl);
-        let mem = builder.get_current_memory();
         let obj_type = Type::make_record(vec![("x", Type::I32)]);
-        let ptr = builder.create_new(mem, obj_type);
-        let store_mem = builder.get_current_memory();
-        let _store = builder.create_store(store_mem, ptr, add_id);
+        let ptr = builder.create_new(obj_type);
+        let _store = builder.create_store(ptr, add_id);
 
         let nodes = builder.nodes();
         let float_ranks = compute_float_ranks(nodes);

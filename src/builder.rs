@@ -7,19 +7,55 @@ use crate::types::*;
 struct VariableState {
     name: String,
     current_def: HashMap<NodeId, NodeId>, // control node -> reaching value
+    is_memory_var: bool, // true for per-type memory chains
 }
 
-/// Built-in variable index for the implicit memory chain.
-/// Memory is tracked as an ordinary SSA variable (VarId 0), sharing the same
-/// Braun-style recursive lookup, Phi insertion, and trivial Phi elimination
-/// used for all other variables.
-pub const MEMORY_VAR: VarId = VarId(0);
 
 /// The main IR-building harness.
 ///
 /// Owns the node arena, output-edge mirror, and SSA variable state.
 /// Constructs nodes on-the-fly with peephole optimizations, constant folding,
 /// and value numbering. Uses Braun-style lazy SSA for Phi placement.
+///
+/// ## Memory Chains (Alias Classes)
+///
+/// Instead of a single global memory chain, each concrete heap type (`Data` or
+/// `Union`) gets its own SSA variable for its memory chain. This means:
+/// - Operations on different types (e.g., `Record{x: I32}` vs `Record{y: F64}`)
+///   are trivially independent — no ordering constraint between them.
+/// - At control merges, only types whose memory state differs between
+///   predecessors get Phis. Unmodified types pass through uncontested.
+/// - Better GVN: loads on different type chains are trivially distinct.
+///
+/// **KNOWN LIMITATION: Type-based, not allocation-site-based.** Two separate
+/// allocations of the same type share one chain and are serialized with
+/// respect to each other. This is correct (same-type ops are ordered
+/// together) but imposes false ordering on independent objects of the same
+/// type. A future upgrade could add allocation-site tags to split chains.
+///
+/// **Frontend contract**: All Load/Store operations require a pointer whose
+/// node type is `Data(..)` or `Union(..)`. Pointers of unknown type (e.g.,
+/// `Any`) must be narrowed via `DynamicCast` first. Attempting to access
+/// memory through a layout-less type panics.
+///
+/// ## Unions: Whole-Value Access Model
+///
+/// `DynamicCast` operates on **values** (loaded from memory or computed), not
+/// on pointers. The access pattern for unions is:
+/// 1. `Load(union_ptr)` → atomically reads the full tagged value
+/// 2. `DynamicCast(value, A)` → narrows the *value* to variant A (in a register)
+/// 3. Project fields, compute new full value
+/// 4. `Store(union_ptr, new_value)` → atomically writes the full tagged value
+///
+/// No narrowed pointer into the union's storage is created. This means:
+/// - `Store(union_ptr, tagged_val)` goes through `VarId(Union(A, B))`.
+/// - `Store(variant_ptr, field_val)` (where variant_ptr is a `New` of type
+///   `Data(A_fields)`) goes through `VarId(Data(A_fields))` — a different chain.
+/// They access disjoint memory. No unsoundness.
+///
+/// For large unions (fields too big for registers), the frontend falls back to
+/// field-level Loads/Stores through the variant type's chain. This serializes
+/// same-typed fields across different variants — correct but conservative.
 pub struct IRBuilder {
     nodes: Vec<Node>,
     node_outputs: Vec<OutputsVec>,
@@ -29,6 +65,13 @@ pub struct IRBuilder {
     sealed: HashSet<NodeId>,
     incomplete_phis: HashMap<(VarId, NodeId), NodeId>, // (var_idx, control) -> operandless Phi
     worklist: Vec<NodeId>,
+    /// Maps a concrete heap type (Data or Union) to the SSA variable for its memory chain.
+    /// Uses full structural equality on Type (walks Arc<[DataField]> on lookup).
+    /// If profiling shows this as a bottleneck, intern Type into a TypeId
+    /// (like SymbolId) for O(1) key operations.
+    type_memory_var: HashMap<Type, VarId>,
+    /// Counter for generating compact debug labels for per-type memory chains.
+    mem_var_counter: u32,
 }
 
 // ── Test-only accessors ──
@@ -41,10 +84,6 @@ impl IRBuilder {
 
     pub(crate) fn node_outputs(&self) -> &[OutputsVec] {
         &self.node_outputs
-    }
-
-    pub(crate) fn incomplete_phis(&self) -> &HashMap<(VarId, NodeId), NodeId> {
-        &self.incomplete_phis
     }
 
     pub(crate) fn worklist(&self) -> &[NodeId] {
@@ -66,20 +105,14 @@ impl IRBuilder {
             node_outputs: vec![OutputsVec::new(), OutputsVec::new(), OutputsVec::new()],
             interned_nodes: HashMap::new(),
             current_control: NodeId(1), // Entry
-            // Variable 0 is reserved for the implicit memory chain
-            variables: vec![VariableState {
-                name: "$memory".to_string(),
-                current_def: HashMap::new(),
-            }],
+            variables: Vec::new(), // No pre-allocated memory variable; per-type chains created on demand
             sealed: HashSet::new(),
             incomplete_phis: HashMap::new(),
             worklist: Vec::new(),
+            type_memory_var: HashMap::new(),
+            mem_var_counter: 0,
         };
         builder.sealed.insert(NodeId(1)); // Entry is sealed from the start
-        // At Entry, the reaching memory is the Memory root node (node 2)
-        builder.variables[MEMORY_VAR.as_usize()]
-            .current_def
-            .insert(NodeId(1), NodeId(2));
         builder
     }
 
@@ -171,14 +204,127 @@ impl IRBuilder {
     }
 
     /// Allocate a new source variable with a human-readable name.
-    /// Returns a VarId starting from 1 (VarId(0) is reserved for the memory chain).
+    /// Returns a VarId starting from 0.
     pub fn create_variable(&mut self, name: &str) -> VarId {
         let idx = self.variables.len();
         self.variables.push(VariableState {
             name: name.to_string(),
             current_def: HashMap::new(),
+            is_memory_var: false,
         });
         VarId(idx)
+    }
+
+    // ── Per-Type Memory Chain Helpers ──
+
+    /// Walk through Identity and StaticCast nodes to find the effective type
+    /// of a pointer for memory-chain resolution. This ensures that a
+    /// StaticCast between structurally-compatible types (e.g., tagged → untagged
+    /// Data with the same fields) maps to the same memory chain, preventing
+    /// unsound disordering of accesses through the original and cast pointers.
+    ///
+    /// UNSOUNDNESS WARNING: If a new node kind is added that changes a pointer's
+    /// type without changing its memory layout, this function MUST be updated
+    /// to look through it. Otherwise accesses through the original and cast
+    /// pointers become unordered with respect to each other — unsound.
+    /// DynamicCast is intentionally NOT looked through (runtime type change).
+    fn resolve_ptr_type(&self, ptr: NodeId) -> &Type {
+        let mut id = ptr;
+        loop {
+            let node = &self.nodes[id.as_usize()];
+            match node.kind {
+                NodeKind::Identity => {
+                    id = match node.get_identity_id() {
+                        Some(real) => real,
+                        None => return &node.t,
+                    };
+                }
+                NodeKind::StaticCast => {
+                    // StaticCast between compatible layouts: look through to
+                    // the input's type chain. The cast changes the type
+                    // annotation but not the actual memory layout.
+                    id = node.get_input(1); // value input
+                }
+                _ => return &node.t,
+            }
+        }
+    }
+
+    /// Get or create the SSA variable for a concrete heap type's memory chain.
+    /// Initializes the chain with the Memory root node at Entry.
+    ///
+    /// KNOWN LIMITATION: For Param-based Data pointers (pointers arriving from
+    /// outside the function), the initial memory state is unknown — the object
+    /// was created before function entry. Initializing with the Memory root
+    /// assumes no prior modifications, which is correct for function entry but
+    /// insufficient for future interprocedural analysis.
+    fn get_or_create_memory_var(&mut self, t: &Type) -> VarId {
+        if let Some(&var) = self.type_memory_var.get(t) {
+            return var;
+        }
+        // Use a compact name ($mem0, $mem1, ...) to avoid bloating
+        // VariableState::name with verbose type debug output for records
+        // with many fields. The full type is recoverable from
+        // type_memory_var if needed for debugging.
+        let idx = self.mem_var_counter;
+        self.mem_var_counter += 1;
+        let var = self.create_variable(&format!("$mem{}", idx));
+        self.variables[var.as_usize()].is_memory_var = true;
+        self.type_memory_var.insert(t.clone(), var);
+
+        // Initialize it with the root Memory node at Entry.
+        // The Memory root (node 2, NodeKind::Memory) is the initial state for
+        // every type's chain. It lives in the arena but has no graph input edges
+        // (outputs list is empty). It is kept alive solely by being referenced
+        // through variable state in per-type chains. A dead-node elimination pass
+        // would need to walk variable state to avoid removing it.
+        self.variables[var.as_usize()]
+            .current_def
+            .insert(NodeId(1), NodeId(2));
+        var
+    }
+
+    /// Resolve the per-type memory chain for a pointer.
+    ///
+    /// Looks through Identity and StaticCast nodes to find the original
+    /// pointer's type chain when a cast preserves structural layout.
+    /// This prevents unsound reordering when the same memory is accessed
+    /// through differently-typed views of the same structure.
+    ///
+    /// Panics if the pointer's resolved type has no concrete memory layout
+    /// (e.g., `Any`, `Control`, `Unit`). The frontend must insert a
+    /// DynamicCast before Load/Store on such pointers.
+    ///
+    /// KNOWN LIMITATION: Does NOT look through DynamicCast nodes — those
+    /// represent runtime type changes and must go through the target type's
+    /// chain (the runtime check ensures they're the same object, but we
+    /// conservatively serialize through the target chain).
+    fn memory_var_for_ptr(&mut self, ptr: NodeId) -> VarId {
+        let t = self.resolve_ptr_type(ptr).clone();
+        match &t {
+            Type::Data(..) | Type::Union(..) => self.get_or_create_memory_var(&t),
+            other => panic!("Load/Store through layout-less type {:?}. Cast first.", other),
+        }
+    }
+
+    /// Get the current memory for a type's chain (used before a New or for inspection).
+    ///
+    /// Note: Takes &mut self because get_or_create_memory_var and read_variable
+    /// can insert Phi nodes. This is not a pure query — it may mutate the builder
+    /// state (adding VarIds, creating Phis).
+    pub fn get_memory_for_type(&mut self, t: &Type) -> NodeId {
+        let var = self.get_or_create_memory_var(t);
+        self.read_variable(var)
+    }
+
+    /// Get the current memory for the alias class of a pointer.
+    ///
+    /// Note: Takes &mut self because memory_var_for_ptr and read_variable
+    /// can insert Phi nodes (Braun-style lazy SSA). Calling this as a
+    /// "read-only" inspection has the side effect of potentially creating Phis.
+    pub fn get_memory_for_ptr(&mut self, ptr: NodeId) -> NodeId {
+        let var = self.memory_var_for_ptr(ptr);
+        self.read_variable(var)
     }
 
     /// Set the current control (program point) for subsequent reads/writes.
@@ -272,7 +418,7 @@ impl IRBuilder {
         // Refine Phi's type: join of all operand types
         // For memory Phis, the type is always Memory regardless of operand types
         // (memory operands are tokens in a chain, their node types are irrelevant)
-        if var == MEMORY_VAR {
+        if self.variables[var.as_usize()].is_memory_var {
             self.nodes[phi_id.as_usize()].t = Type::Memory;
         } else if operand_types.is_empty() {
             self.nodes[phi_id.as_usize()].t = Type::Never;
@@ -325,21 +471,6 @@ impl IRBuilder {
         })
     }
 
-    // ── Memory Convenience Methods ──
-
-    /// Read the current memory at the current control point.
-    /// Inserts memory Phis as needed (same Braun algorithm as variables).
-    #[inline]
-    pub fn get_current_memory(&mut self) -> NodeId {
-        self.read_variable(MEMORY_VAR)
-    }
-
-    /// Set the current memory at the current control point.
-    #[inline]
-    pub fn set_current_memory(&mut self, mem: NodeId) {
-        self.write_variable(MEMORY_VAR, mem);
-    }
-
     /// Get the control predecessors of a control node.
     fn get_control_predecessors(&self, ctrl: NodeId) -> OutputsVec {
         let mut preds = OutputsVec::new();
@@ -376,7 +507,7 @@ impl IRBuilder {
     }
 
     /// Seal a control node — no more predecessors will be added.
-    /// Fills in any incomplete Phis (including memory Phis, since memory is VarId 0)
+    /// Fills in any incomplete Phis (including per-type memory chain Phis)
     /// that were placed before sealing.
     /// TODO: Consider verifying that all back-edges have been added before sealing
     /// a Loop node. Currently the protocol is caller-enforced (add back-edges, then seal).
@@ -627,24 +758,31 @@ impl IRBuilder {
 
     // ── Memory Builder Methods ──
 
-    /// Create a New (allocation) node.
-    pub fn create_new(&mut self, mem: NodeId, alloc_type: Type) -> NodeId {
+    /// Create a New (allocation) node. Resolves memory from the type's own chain.
+    pub fn create_new(&mut self, alloc_type: Type) -> NodeId {
         let control = self.current_control;
+        let var = self.get_or_create_memory_var(&alloc_type);
+        let mem = self.read_variable(var);
         let mut node = Node::new(NodeKind::New, alloc_type);
         node.set_inputs(&[control, mem]);
         let id = self.intern_node(&node);
-        self.variables[MEMORY_VAR.as_usize()]
-            .current_def
-            .insert(control, id);
+        self.write_variable(var, id);
         id
     }
 
     /// Create a Load (memory read) node with on-the-fly Load-Store forwarding.
-    /// TODO: Load-Store forwarding only checks the immediate memory predecessor.
-    /// Consider walking back through intermediate Stores to different ptrs:
-    ///   Store(ptr, 10) -> Store(ptr1, 7) -> Load(ptr, mem=Store(ptr1,7))
-    /// currently misses forwarding the value 10 from the earlier Store.
-    pub fn create_load(&mut self, mem: NodeId, ptr: NodeId, loaded_type: Type) -> NodeId {
+    /// Resolves memory from the pointer's type chain internally (no mem param).
+    ///
+    /// KNOWN LIMITATION: Load-Store forwarding only checks the immediate memory
+    /// predecessor. For a chain like:
+    ///   Store(ptr1, 10) -> Store(ptr2, 7) -> Load(ptr1, mem=Store(ptr2, 7))
+    /// forwarding misses the value 10 from the earlier Store. Walking back
+    /// through intermediate Stores to different ptrs would catch more
+    /// opportunities but is deferred.
+    pub fn create_load(&mut self, ptr: NodeId, loaded_type: Type) -> NodeId {
+        let var = self.memory_var_for_ptr(ptr);
+        let mem = self.read_variable(var);
+
         // Peephole: Load-Store forwarding
         let mem_node = &self.nodes[mem.as_usize()];
         if mem_node.kind == NodeKind::Store && mem_node.get_input(2) == ptr {
@@ -657,15 +795,15 @@ impl IRBuilder {
         self.intern_node(&node)
     }
 
-    /// Create a Store (memory write) node.
-    pub fn create_store(&mut self, mem: NodeId, ptr: NodeId, value: NodeId) -> NodeId {
+    /// Create a Store (memory write) node. Resolves memory from the pointer's type chain.
+    pub fn create_store(&mut self, ptr: NodeId, value: NodeId) -> NodeId {
         let control = self.current_control;
+        let var = self.memory_var_for_ptr(ptr);
+        let mem = self.read_variable(var);
         let mut node = Node::new(NodeKind::Store, Type::Memory);
         node.set_inputs(&[control, mem, ptr, value]);
         let id = self.intern_node(&node);
-        self.variables[MEMORY_VAR.as_usize()]
-            .current_def
-            .insert(control, id);
+        self.write_variable(var, id);
         id
     }
 
